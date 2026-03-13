@@ -62,8 +62,19 @@ impl Pasteboard {
                 }
             }
 
-            // If it wasn't a string, try the various supported image types.
-            for format in ImageFormat::iter() {
+            // Only probe concrete pasteboard image types here. `public.image`
+            // is intentionally excluded so generic image payloads are not
+            // misclassified as EXR.
+            for format in [
+                ImageFormat::Png,
+                ImageFormat::Jpeg,
+                ImageFormat::Webp,
+                ImageFormat::Gif,
+                ImageFormat::Bmp,
+                ImageFormat::Svg,
+                ImageFormat::Ico,
+                ImageFormat::Tiff,
+            ] {
                 if let Some(item) = self.read_image(format) {
                     return Some(item);
                 }
