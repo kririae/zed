@@ -1005,6 +1005,7 @@ impl Clipboard {
             ImageFormat::Bmp => self.inner.atoms.BMP__MIME,
             ImageFormat::Tiff => self.inner.atoms.TIFF_MIME,
             ImageFormat::Ico => self.inner.atoms.ICO__MIME,
+            ImageFormat::Exr => self.inner.atoms.PNG__MIME,
         };
         let data = vec![ClipboardData {
             bytes: image.bytes,

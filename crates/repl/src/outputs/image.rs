@@ -54,6 +54,7 @@ impl ImageView {
             image::ImageFormat::Tiff => ImageFormat::Tiff,
             image::ImageFormat::Bmp => ImageFormat::Bmp,
             image::ImageFormat::Ico => ImageFormat::Ico,
+            image::ImageFormat::OpenExr => ImageFormat::Exr,
             format => {
                 anyhow::bail!("unsupported image format {format:?}");
             }

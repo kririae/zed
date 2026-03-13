@@ -241,6 +241,7 @@ impl From<ImageFormat> for UTType {
             ImageFormat::Bmp => Self::bmp(),
             ImageFormat::Svg => Self::svg(),
             ImageFormat::Ico => Self::ico(),
+            ImageFormat::Exr => Self::image(),
         }
     }
 }
@@ -249,6 +250,10 @@ impl From<ImageFormat> for UTType {
 pub struct UTType(id);
 
 impl UTType {
+    pub fn image() -> Self {
+        Self(unsafe { ns_string("public.image") })
+    }
+
     pub fn png() -> Self {
         // https://developer.apple.com/documentation/uniformtypeidentifiers/uttype-swift.struct/png
         Self(unsafe { NSPasteboardTypePNG }) // This is a rare case where there's a built-in NSPasteboardType

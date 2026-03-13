@@ -71,6 +71,7 @@ impl Render for ImageInfo {
                 ImageFormat::Tiff => "TIFF",
                 ImageFormat::Bmp => "BMP",
                 ImageFormat::Ico => "ICO",
+                ImageFormat::OpenExr => "EXR",
                 ImageFormat::Avif => "Avif",
                 _ => "Unknown",
             }

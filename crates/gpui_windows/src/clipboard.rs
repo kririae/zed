@@ -450,6 +450,7 @@ fn gpui_image_format_to_image(value: ImageFormat) -> image::ImageFormat {
         // TODO: ImageFormat::Svg
         ImageFormat::Bmp => image::ImageFormat::Bmp,
         ImageFormat::Tiff => image::ImageFormat::Tiff,
+        ImageFormat::Exr => image::ImageFormat::OpenExr,
         _ => unreachable!(),
     }
 }
