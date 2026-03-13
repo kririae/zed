@@ -1804,6 +1804,8 @@ pub enum ImageFormat {
     Tiff,
     /// .ico
     Ico,
+    /// .exr
+    Exr,
 }
 
 impl ImageFormat {
@@ -1818,6 +1820,7 @@ impl ImageFormat {
             ImageFormat::Bmp => "image/bmp",
             ImageFormat::Tiff => "image/tiff",
             ImageFormat::Ico => "image/ico",
+            ImageFormat::Exr => "image/exr",
         }
     }
 
@@ -1832,6 +1835,7 @@ impl ImageFormat {
             "image/bmp" => Some(Self::Bmp),
             "image/tiff" | "image/tif" => Some(Self::Tiff),
             "image/ico" => Some(Self::Ico),
+            "image/exr" | "image/x-exr" => Some(Self::Exr),
             _ => None,
         }
     }
@@ -1939,6 +1943,7 @@ impl Image {
             ImageFormat::Bmp => frames_for_image(&self.bytes, image::ImageFormat::Bmp)?,
             ImageFormat::Tiff => frames_for_image(&self.bytes, image::ImageFormat::Tiff)?,
             ImageFormat::Ico => frames_for_image(&self.bytes, image::ImageFormat::Ico)?,
+            ImageFormat::Exr => frames_for_image(&self.bytes, image::ImageFormat::OpenExr)?,
             ImageFormat::Svg => {
                 return svg_renderer
                     .render_single_frame(&self.bytes, 1.0, false)
