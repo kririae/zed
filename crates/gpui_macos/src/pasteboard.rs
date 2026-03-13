@@ -6,6 +6,7 @@ use cocoa::{
     base::{id, nil},
     foundation::NSData,
 };
+use image::ImageEncoder as _;
 use objc::{msg_send, runtime::Object, sel, sel_impl};
 use strum::IntoEnumIterator as _;
 
@@ -223,14 +224,43 @@ impl Pasteboard {
         unsafe {
             self.inner.clearContents();
 
+            let (bytes, format) = if image.format == ImageFormat::Exr {
+                let dynamic_image =
+                    image::load_from_memory_with_format(&image.bytes, image::ImageFormat::OpenExr)
+                        .ok();
+
+                let Some(dynamic_image) = dynamic_image else {
+                    return;
+                };
+
+                let rgba = dynamic_image.into_rgba8();
+                let mut png_bytes = Vec::new();
+                let encoder = image::codecs::png::PngEncoder::new(&mut png_bytes);
+                if encoder
+                    .write_image(
+                        rgba.as_raw(),
+                        rgba.width(),
+                        rgba.height(),
+                        image::ExtendedColorType::Rgba8,
+                    )
+                    .is_err()
+                {
+                    return;
+                }
+
+                (png_bytes, ImageFormat::Png)
+            } else {
+                (image.bytes.clone(), image.format)
+            };
+
             let bytes = NSData::dataWithBytes_length_(
                 nil,
-                image.bytes.as_ptr() as *const c_void,
-                image.bytes.len() as u64,
+                bytes.as_ptr() as *const c_void,
+                bytes.len() as u64,
             );
 
             self.inner
-                .setData_forType(bytes, Into::<UTType>::into(image.format).inner_mut());
+                .setData_forType(bytes, Into::<UTType>::into(format).inner_mut());
         }
     }
 }
@@ -252,7 +282,7 @@ impl From<ImageFormat> for UTType {
             ImageFormat::Bmp => Self::bmp(),
             ImageFormat::Svg => Self::svg(),
             ImageFormat::Ico => Self::ico(),
-            ImageFormat::Exr => Self::image(),
+            ImageFormat::Exr => Self::png(),
         }
     }
 }
@@ -261,10 +291,6 @@ impl From<ImageFormat> for UTType {
 pub struct UTType(id);
 
 impl UTType {
-    pub fn image() -> Self {
-        Self(unsafe { ns_string("public.image") })
-    }
-
     pub fn png() -> Self {
         // https://developer.apple.com/documentation/uniformtypeidentifiers/uttype-swift.struct/png
         Self(unsafe { NSPasteboardTypePNG }) // This is a rare case where there's a built-in NSPasteboardType
