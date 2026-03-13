@@ -1,10 +1,12 @@
 use fs::FakeFs;
 use gpui::TestAppContext;
+use image::{DynamicImage, ImageBuffer, Rgba};
 use project::Project;
 use project::ProjectPath;
 use project::image_store::*;
 use serde_json::json;
 use settings::SettingsStore;
+use std::io::Cursor;
 use util::rel_path::rel_path;
 
 pub fn init_test(cx: &mut TestAppContext) {
@@ -14,6 +16,19 @@ pub fn init_test(cx: &mut TestAppContext) {
         let settings_store = SettingsStore::test(cx);
         cx.set_global(settings_store);
     });
+}
+
+fn single_pixel_exr() -> Vec<u8> {
+    let image = DynamicImage::ImageRgba32F(ImageBuffer::from_pixel(
+        1,
+        1,
+        Rgba([1.0_f32, 1.0_f32, 1.0_f32, 1.0_f32]),
+    ));
+    let mut bytes = Cursor::new(Vec::new());
+    image
+        .write_to(&mut bytes, image::ImageFormat::OpenExr)
+        .expect("writing 1x1 EXR fixture should succeed");
+    bytes.into_inner()
 }
 
 #[gpui::test]
@@ -75,4 +90,49 @@ fn test_compute_metadata_from_bytes() {
     assert_eq!(metadata.file_size, png_bytes.len() as u64);
     assert_eq!(metadata.format, image::ImageFormat::Png);
     assert!(metadata.colors.is_some());
+}
+
+#[gpui::test]
+fn test_compute_metadata_from_exr_bytes() {
+    let exr_bytes = single_pixel_exr();
+
+    let metadata = ImageItem::compute_metadata_from_bytes(&exr_bytes).unwrap();
+
+    assert_eq!(metadata.width, 1);
+    assert_eq!(metadata.height, 1);
+    assert_eq!(metadata.file_size, exr_bytes.len() as u64);
+    assert_eq!(metadata.format, image::ImageFormat::OpenExr);
+}
+
+#[gpui::test]
+async fn test_open_exr_image(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let exr_bytes = single_pixel_exr();
+
+    fs.insert_tree("/root", json!({})).await;
+    fs.insert_file("/root/image_1.exr", exr_bytes.clone()).await;
+
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+
+    let worktree_id = cx.update(|cx| project.read(cx).worktrees(cx).next().unwrap().read(cx).id());
+
+    let project_path = ProjectPath {
+        worktree_id,
+        path: rel_path("image_1.exr").into(),
+    };
+
+    let image = project
+        .update(cx, |project, cx| project.open_image(project_path, cx))
+        .await
+        .unwrap();
+
+    let metadata = cx
+        .update(|cx| image.read(cx).image_metadata)
+        .expect("opened EXR image should have metadata");
+
+    assert_eq!(metadata.width, 1);
+    assert_eq!(metadata.height, 1);
+    assert_eq!(metadata.file_size, exr_bytes.len() as u64);
+    assert_eq!(metadata.format, image::ImageFormat::OpenExr);
 }
