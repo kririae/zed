@@ -107,25 +107,28 @@ impl LanguageModelImage {
             let image_bytes = Cursor::new(data.bytes());
             let dynamic_image = match data.format() {
                 ImageFormat::Png => image::codecs::png::PngDecoder::new(image_bytes)
-                    .and_then(image::DynamicImage::from_decoder),
+                    .and_then(image::DynamicImage::from_decoder)
+                    .log_err()?,
                 ImageFormat::Jpeg => image::codecs::jpeg::JpegDecoder::new(image_bytes)
-                    .and_then(image::DynamicImage::from_decoder),
+                    .and_then(image::DynamicImage::from_decoder)
+                    .log_err()?,
                 ImageFormat::Webp => image::codecs::webp::WebPDecoder::new(image_bytes)
-                    .and_then(image::DynamicImage::from_decoder),
+                    .and_then(image::DynamicImage::from_decoder)
+                    .log_err()?,
                 ImageFormat::Gif => image::codecs::gif::GifDecoder::new(image_bytes)
-                    .and_then(image::DynamicImage::from_decoder),
+                    .and_then(image::DynamicImage::from_decoder)
+                    .log_err()?,
                 ImageFormat::Bmp => image::codecs::bmp::BmpDecoder::new(image_bytes)
-                    .and_then(image::DynamicImage::from_decoder),
+                    .and_then(image::DynamicImage::from_decoder)
+                    .log_err()?,
                 ImageFormat::Tiff => image::codecs::tiff::TiffDecoder::new(image_bytes)
-                    .and_then(image::DynamicImage::from_decoder),
-                ImageFormat::Exr => {
-                    image::load_from_memory_with_format(data.bytes(), image::ImageFormat::OpenExr)
-                        .map(image::DynamicImage::into_rgba8)
-                        .map(image::DynamicImage::ImageRgba8)
-                }
+                    .and_then(image::DynamicImage::from_decoder)
+                    .log_err()?,
+                ImageFormat::Exr => image::DynamicImage::ImageRgba8(
+                    gpui::render_exr_to_sdr_rgba(data.bytes()).log_err()?,
+                ),
                 _ => return None,
-            }
-            .log_err()?;
+            };
 
             let width = dynamic_image.width();
             let height = dynamic_image.height();
@@ -573,15 +576,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_from_image_converts_exr_to_png(cx: &mut TestAppContext) {
+    async fn test_from_image_converts_exr_using_shared_sdr_render(cx: &mut TestAppContext) {
         let exr_bytes = single_pixel_exr_bytes([1.0_f32, 0.5_f32, 0.25_f32, 1.0_f32]);
-        let expected_pixel =
-            image::load_from_memory_with_format(&exr_bytes, image::ImageFormat::OpenExr)
-                .expect("generated EXR should decode")
-                .into_rgba8()
-                .get_pixel(0, 0)
-                .0;
-        let image = gpui::Image::from_bytes(ImageFormat::Exr, exr_bytes);
+        let image = gpui::Image::from_bytes(ImageFormat::Exr, exr_bytes.clone());
 
         let language_model_image = cx
             .update(|cx| LanguageModelImage::from_image(Arc::new(image), cx))
@@ -593,9 +590,10 @@ mod tests {
             image::load_from_memory_with_format(&encoded_png, image::ImageFormat::Png)
                 .expect("language model payload should decode as PNG")
                 .into_rgba8();
+        let rendered = gpui::render_exr_to_sdr_rgba(&exr_bytes).unwrap();
 
         assert_eq!(decoded_png.dimensions(), (1, 1));
-        assert_eq!(decoded_png.get_pixel(0, 0).0, expected_pixel);
+        assert_eq!(decoded_png.as_raw(), rendered.as_raw());
     }
 
     #[test]

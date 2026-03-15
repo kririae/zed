@@ -14,6 +14,7 @@ use gpui::{AppContext as _, Entity};
 use gpui::TestAppContext;
 use image::{DynamicImage, ImageBuffer, Rgba};
 use language::LanguageRegistry;
+use language::DiskState;
 use node_runtime::NodeRuntime;
 use parking_lot::Mutex;
 use project::Project;
@@ -24,6 +25,7 @@ use rpc::{AnyProtoClient, TypedEnvelope, proto};
 use serde_json::json;
 use settings::SettingsStore;
 use std::io::Cursor;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -66,6 +68,15 @@ fn single_pixel_exr() -> Vec<u8> {
         .write_to(&mut bytes, image::ImageFormat::OpenExr)
         .expect("writing 1x1 EXR fixture should succeed");
     bytes.into_inner()
+}
+
+fn spawn_wait_for_renderable_image(
+    cx: &TestAppContext,
+    image: Entity<ImageItem>,
+) -> gpui::Task<anyhow::Result<Arc<gpui::Image>>> {
+    cx.spawn(move |mut async_cx| async move {
+        ImageItem::wait_for_renderable_image(image, &mut async_cx).await
+    })
 }
 
 #[derive(Clone)]
@@ -695,4 +706,168 @@ async fn test_open_exr_image(cx: &mut TestAppContext) {
     assert_eq!(metadata.height, 1);
     assert_eq!(metadata.file_size, exr_bytes.len() as u64);
     assert_eq!(metadata.format, image::ImageFormat::OpenExr);
+}
+
+#[gpui::test]
+async fn test_wait_for_renderable_image_completes_immediately_when_image_is_loaded(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+
+    fs.insert_tree("/root", json!({})).await;
+    fs.insert_file("/root/image_1.png", single_pixel_png()).await;
+
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let worktree_id = cx.update(|cx| project.read(cx).worktrees(cx).next().unwrap().read(cx).id());
+    let image = project
+        .update(cx, |project, cx| {
+            project.open_image(
+                ProjectPath {
+                    worktree_id,
+                    path: rel_path("image_1.png").into(),
+                },
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+    cx.condition(&image, |image, _cx| image.image.is_some()).await;
+
+    let expected_image_id = cx.update(|cx| image.read(cx).image.clone().unwrap().id());
+    let wait_task = spawn_wait_for_renderable_image(cx, image);
+    cx.run_until_parked();
+
+    assert!(wait_task.is_ready());
+
+    let waited_image = wait_task.await.unwrap();
+    assert_eq!(waited_image.id(), expected_image_id);
+}
+
+#[gpui::test]
+async fn test_wait_for_renderable_image_returns_stored_failure(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+
+    fs.insert_tree("/root", json!({})).await;
+    fs.insert_file("/root/image_1.png", b"not an image".to_vec()).await;
+
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let worktree_id = cx.update(|cx| project.read(cx).worktrees(cx).next().unwrap().read(cx).id());
+    let image = project
+        .update(cx, |project, cx| {
+            project.open_image(
+                ProjectPath {
+                    worktree_id,
+                    path: rel_path("image_1.png").into(),
+                },
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+    cx.condition(&image, |image, _cx| {
+        matches!(image.load_state, ImageLoadState::Failed(_))
+    })
+    .await;
+
+    let expected_error = cx
+        .update(|cx| image.read(cx).load_error().cloned())
+        .expect("failed image should store an error");
+
+    let wait_task = spawn_wait_for_renderable_image(cx, image);
+    cx.run_until_parked();
+
+    assert!(wait_task.is_ready());
+    let error = wait_task.await.expect_err("wait should surface stored failure");
+    assert_eq!(error.to_string(), expected_error.to_string());
+}
+
+#[gpui::test]
+async fn test_wait_for_renderable_image_wakes_multiple_waiters(cx: &mut TestAppContext) {
+    init_test(cx);
+    let blocking = BlockingFs::new(FakeFs::new(cx.executor()));
+
+    blocking.insert_tree("/root", json!({})).await;
+    blocking
+        .insert_file("/root/image_1.png", single_pixel_png())
+        .await;
+    blocking.block_path("/root/image_1.png");
+
+    let project = Project::test(blocking.clone(), ["/root".as_ref()], cx).await;
+    let worktree_id = cx.update(|cx| project.read(cx).worktrees(cx).next().unwrap().read(cx).id());
+    let open_task = project.update(cx, |project, cx| {
+        project.open_image(
+            ProjectPath {
+                worktree_id,
+                path: rel_path("image_1.png").into(),
+            },
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    cx.executor().run_until_parked();
+    cx.run_until_parked();
+
+    let image = open_task
+        .now_or_never()
+        .expect("placeholder should be returned immediately")
+        .expect("placeholder should be valid");
+    let wait_task_one = spawn_wait_for_renderable_image(cx, image.clone());
+    let wait_task_two = spawn_wait_for_renderable_image(cx, image.clone());
+    cx.run_until_parked();
+
+    assert!(!wait_task_one.is_ready());
+    assert!(!wait_task_two.is_ready());
+
+    blocking.release_path("/root/image_1.png");
+    cx.executor().run_until_parked();
+    cx.run_until_parked();
+
+    let expected_image = cx.update(|cx| image.read(cx).image.clone().unwrap());
+    let waited_image_one = wait_task_one.await.unwrap();
+    let waited_image_two = wait_task_two.await.unwrap();
+    assert_eq!(waited_image_one.id(), expected_image.id());
+    assert_eq!(waited_image_two.id(), expected_image.id());
+}
+
+#[gpui::test]
+async fn test_wait_for_renderable_image_fails_if_item_drops_before_load_completion(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+
+    fs.insert_tree("/root", json!({})).await;
+
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let worktree = cx.update(|cx| project.read(cx).worktrees(cx).next().unwrap());
+    let file = Arc::new(worktree::File {
+        worktree,
+        path: rel_path("image_1.png").into(),
+        disk_state: DiskState::New,
+        entry_id: None,
+        is_local: true,
+        is_private: false,
+    });
+    let image = cx.update(|cx| {
+        cx.new(|_cx| ImageItem::new_loading_for_test(NonZeroU64::new(1).unwrap().into(), file))
+    });
+    let weak_image = image.downgrade();
+
+    let wait_task = spawn_wait_for_renderable_image(cx, image.clone());
+    cx.run_until_parked();
+    assert!(!wait_task.is_ready());
+
+    drop(image);
+    cx.update(|_| {});
+    weak_image.assert_released();
+    cx.run_until_parked();
+
+    let error = wait_task
+        .await
+        .expect_err("dropped image should wake waiters with an error");
+    assert_eq!(error.to_string(), "image disappeared before it finished loading");
 }

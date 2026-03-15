@@ -16,7 +16,6 @@ use rpc::{AnyProtoClient, ErrorExt as _, TypedEnvelope, proto};
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use util::{ResultExt, rel_path::RelPath};
 use worktree::{LoadedBinaryFile, PathChange, Worktree, WorktreeId};
 
@@ -116,6 +115,7 @@ pub struct ImageItem {
     pub load_task: Option<Task<()>>,
     pub image_metadata: Option<ImageMetadata>,
     pub load_state: ImageLoadState,
+    waiters: Vec<oneshot::Sender<std::result::Result<Arc<gpui::Image>, SharedString>>>,
 }
 
 impl ImageItem {
@@ -159,21 +159,34 @@ impl ImageItem {
         image_item: Entity<ImageItem>,
         cx: &mut AsyncApp,
     ) -> Result<Arc<gpui::Image>> {
-        loop {
-            let (image, load_state) =
-                cx.read_entity(&image_item, |image_item, _cx| {
-                    (image_item.image.clone(), image_item.load_state.clone())
-                });
+        enum WaitState {
+            Ready(std::result::Result<Arc<gpui::Image>, SharedString>),
+            Pending(oneshot::Receiver<std::result::Result<Arc<gpui::Image>, SharedString>>),
+        }
 
-            if let Some(image) = image {
-                return Ok(image);
+        let wait_state = image_item.update(cx, |image_item, _cx| {
+            if let Some(image) = image_item.image.clone() {
+                return WaitState::Ready(Ok(image));
             }
 
-            if let ImageLoadState::Failed(message) = load_state {
-                anyhow::bail!("{message}");
+            if let ImageLoadState::Failed(message) = &image_item.load_state {
+                return WaitState::Ready(Err(message.clone()));
             }
 
-            cx.background_executor().timer(Duration::from_millis(10)).await;
+            let (sender, receiver) = oneshot::channel();
+            image_item.waiters.push(sender);
+            WaitState::Pending(receiver)
+        });
+        drop(image_item);
+
+        match wait_state {
+            WaitState::Ready(result) => {
+                result.map_err(|message| anyhow::anyhow!("{message}"))
+            }
+            WaitState::Pending(receiver) => receiver
+                .await
+                .map_err(|_| anyhow::anyhow!("image disappeared before it finished loading"))?
+                .map_err(|message| anyhow::anyhow!("{message}")),
         }
     }
 
@@ -217,10 +230,11 @@ impl ImageItem {
         if let Some(file) = file {
             self.file = file;
         }
-        self.image = Some(image);
+        self.image = Some(image.clone());
         self.image_metadata = metadata;
         self.load_state = ImageLoadState::Loaded;
         self.load_task = None;
+        self.resolve_waiters(Ok(image));
 
         cx.emit(ImageItemEvent::LoadStateChanged);
         if file_changed {
@@ -233,10 +247,20 @@ impl ImageItem {
     }
 
     fn set_failed(&mut self, message: SharedString, cx: &mut Context<Self>) {
-        self.load_state = ImageLoadState::Failed(message);
+        self.load_state = ImageLoadState::Failed(message.clone());
         self.load_task = None;
+        self.resolve_waiters(Err(message));
         cx.emit(ImageItemEvent::LoadStateChanged);
         cx.notify();
+    }
+
+    fn resolve_waiters(
+        &mut self,
+        result: std::result::Result<Arc<gpui::Image>, SharedString>,
+    ) {
+        for waiter in self.waiters.drain(..) {
+            if waiter.send(result.clone()).is_err() {}
+        }
     }
 
     fn file_updated(&mut self, new_file: Arc<worktree::File>, cx: &mut Context<Self>) {
@@ -299,6 +323,25 @@ impl ImageItem {
             tx.send(()).log_err();
         }));
         Some(rx)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_loading_for_test(id: ImageId, file: Arc<worktree::File>) -> Self {
+        Self {
+            id,
+            file,
+            image: None,
+            load_task: None,
+            image_metadata: None,
+            load_state: ImageLoadState::Loading,
+            waiters: Vec::new(),
+        }
+    }
+}
+
+impl Drop for ImageItem {
+    fn drop(&mut self) {
+        self.resolve_waiters(Err("image disappeared before it finished loading".into()));
     }
 }
 
@@ -733,6 +776,7 @@ impl RemoteImageStore {
                                 image_metadata,
                                 load_task: None,
                                 load_state: ImageLoadState::Loaded,
+                                waiters: Vec::new(),
                             });
 
                             Ok(Some(entity))
@@ -774,6 +818,7 @@ impl ImageStoreImpl for Entity<LocalImageStore> {
                 load_task: None,
                 image_metadata: None,
                 load_state: ImageLoadState::Loading,
+                waiters: Vec::new(),
             });
             let image_id = cx.read_entity(&entity, |model, _| model.id);
 
@@ -876,6 +921,7 @@ impl ImageStoreImpl for Entity<RemoteImageStore> {
                 load_task: None,
                 image_metadata: None,
                 load_state: ImageLoadState::Loading,
+                waiters: Vec::new(),
             });
             let placeholder_id = cx.read_entity(&placeholder, |image, _| image.id);
 

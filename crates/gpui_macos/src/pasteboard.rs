@@ -222,36 +222,10 @@ impl Pasteboard {
 
     unsafe fn write_image(&self, image: &Image) {
         unsafe {
-            self.inner.clearContents();
-
-            let (bytes, format) = if image.format == ImageFormat::Exr {
-                let dynamic_image =
-                    image::load_from_memory_with_format(&image.bytes, image::ImageFormat::OpenExr)
-                        .ok();
-
-                let Some(dynamic_image) = dynamic_image else {
-                    return;
-                };
-
-                let rgba = dynamic_image.into_rgba8();
-                let mut png_bytes = Vec::new();
-                let encoder = image::codecs::png::PngEncoder::new(&mut png_bytes);
-                if encoder
-                    .write_image(
-                        rgba.as_raw(),
-                        rgba.width(),
-                        rgba.height(),
-                        image::ExtendedColorType::Rgba8,
-                    )
-                    .is_err()
-                {
-                    return;
-                }
-
-                (png_bytes, ImageFormat::Png)
-            } else {
-                (image.bytes.clone(), image.format)
+            let Some((bytes, format)) = prepare_image_for_pasteboard(image) else {
+                return;
             };
+            self.inner.clearContents();
 
             let bytes = NSData::dataWithBytes_length_(
                 nil,
@@ -263,6 +237,26 @@ impl Pasteboard {
                 .setData_forType(bytes, Into::<UTType>::into(format).inner_mut());
         }
     }
+}
+
+fn prepare_image_for_pasteboard(image: &Image) -> Option<(Vec<u8>, ImageFormat)> {
+    if image.format != ImageFormat::Exr {
+        return Some((image.bytes.clone(), image.format));
+    }
+
+    let rgba = gpui::render_exr_to_sdr_rgba(&image.bytes).ok()?;
+    let mut png_bytes = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new(&mut png_bytes);
+    encoder
+        .write_image(
+            rgba.as_raw(),
+            rgba.width(),
+            rgba.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .ok()?;
+
+    Some((png_bytes, ImageFormat::Png))
 }
 
 #[link(name = "AppKit", kind = "framework")]
@@ -343,10 +337,20 @@ impl UTType {
 #[cfg(test)]
 mod tests {
     use cocoa::{appkit::NSPasteboardTypeString, foundation::NSData};
+    use image::{DynamicImage, ImageBuffer, Rgba};
 
     use gpui::{ClipboardEntry, ClipboardItem, ClipboardString};
 
     use super::*;
+
+    fn single_pixel_exr_bytes(pixel: [f32; 4]) -> Vec<u8> {
+        let image = DynamicImage::ImageRgba32F(ImageBuffer::from_pixel(1, 1, Rgba(pixel)));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut bytes, image::ImageFormat::OpenExr)
+            .expect("writing 1x1 EXR fixture should succeed");
+        bytes.into_inner()
+    }
 
     #[test]
     fn test_string() {
@@ -380,5 +384,22 @@ mod tests {
             pasteboard.read(),
             Some(ClipboardItem::new_string(text_from_other_app.to_string()))
         );
+    }
+
+    #[test]
+    fn test_prepare_exr_image_for_pasteboard_matches_shared_sdr_render() {
+        let exr_bytes = single_pixel_exr_bytes([1.0_f32, 0.5_f32, 0.25_f32, 1.0_f32]);
+        let image = Image::from_bytes(ImageFormat::Exr, exr_bytes);
+
+        let (prepared_bytes, prepared_format) =
+            prepare_image_for_pasteboard(&image).expect("EXR pasteboard preparation should work");
+        let rendered = gpui::render_exr_to_sdr_rgba(image.bytes()).unwrap();
+        let decoded_png =
+            image::load_from_memory_with_format(&prepared_bytes, image::ImageFormat::Png)
+                .expect("pasteboard EXR payload should decode as PNG")
+                .into_rgba8();
+
+        assert_eq!(prepared_format, ImageFormat::Png);
+        assert_eq!(decoded_png.as_raw(), rendered.as_raw());
     }
 }
