@@ -954,9 +954,7 @@ fn prepare_image_for_clipboard(image: &Image) -> Result<Image> {
         return Ok(image.clone());
     }
 
-    let rgba = image::load_from_memory_with_format(&image.bytes, image::ImageFormat::OpenExr)
-        .map_err(|_| Error::ConversionFailure)?
-        .into_rgba8();
+    let rgba = gpui::render_exr_to_sdr_rgba(&image.bytes).map_err(|_| Error::ConversionFailure)?;
     let mut png_bytes = Vec::new();
     image::codecs::png::PngEncoder::new(&mut png_bytes)
         .write_image(
@@ -1310,17 +1308,12 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_exr_image_for_clipboard_transcodes_to_decodable_png() {
+    fn test_prepare_exr_image_for_clipboard_matches_shared_sdr_render() {
         let exr_bytes = single_pixel_exr_bytes([1.0_f32, 0.5_f32, 0.25_f32, 1.0_f32]);
-        let expected_pixel =
-            image::load_from_memory_with_format(&exr_bytes, image::ImageFormat::OpenExr)
-                .expect("generated EXR should decode")
-                .into_rgba8()
-                .get_pixel(0, 0)
-                .0;
         let exr = Image::from_bytes(ImageFormat::Exr, exr_bytes);
 
         let prepared = prepare_image_for_clipboard(&exr).unwrap();
+        let rendered = gpui::render_exr_to_sdr_rgba(exr.bytes()).unwrap();
         let decoded_png =
             image::load_from_memory_with_format(&prepared.bytes, image::ImageFormat::Png)
                 .expect("transcoded clipboard payload should decode as PNG")
@@ -1333,8 +1326,7 @@ mod tests {
             image::ImageFormat::Png
         );
         assert_eq!(decoded_png.dimensions(), (1, 1));
-        assert_ne!(expected_pixel, [255, 255, 255, 255]);
-        assert_eq!(decoded_png.get_pixel(0, 0).0, expected_pixel);
+        assert_eq!(decoded_png.as_raw(), rendered.as_raw());
     }
 
     #[test]

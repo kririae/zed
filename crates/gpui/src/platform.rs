@@ -1964,9 +1964,8 @@ pub(crate) fn render_still_image_frames(
     format: image::ImageFormat,
 ) -> Result<SmallVec<[Frame; 1]>> {
     let data = match format {
-        image::ImageFormat::OpenExr | image::ImageFormat::Hdr => {
-            tone_map_hdr_still_image(bytes, format)?
-        }
+        image::ImageFormat::OpenExr => rgba_image_to_bgra(render_exr_to_sdr_rgba(bytes)?),
+        image::ImageFormat::Hdr => tone_map_hdr_still_image(bytes, format)?,
         _ => {
             let mut data = image::load_from_memory_with_format(bytes, format)?.into_rgba8();
             for pixel in data.chunks_exact_mut(4) {
@@ -1979,28 +1978,72 @@ pub(crate) fn render_still_image_frames(
     Ok(SmallVec::from_elem(Frame::new(data), 1))
 }
 
+struct WorkingImageRgba32f {
+    width: u32,
+    height: u32,
+    rgba: Vec<f32>,
+}
+
+fn decode_exr_to_working_rgba(bytes: &[u8]) -> Result<WorkingImageRgba32f> {
+    let image = image::load_from_memory_with_format(bytes, image::ImageFormat::OpenExr)?
+        .into_rgba32f();
+    let (width, height) = image.dimensions();
+
+    Ok(WorkingImageRgba32f {
+        width,
+        height,
+        rgba: image.into_raw(),
+    })
+}
+
+/// Render scene-linear EXR bytes to 8-bit SDR RGBA using GPUI's shared display transform.
+pub fn render_exr_to_sdr_rgba(bytes: &[u8]) -> Result<RgbaImage> {
+    let working_image = decode_exr_to_working_rgba(bytes)?;
+    tone_map_linear_rgba_to_sdr_rgba(
+        working_image.width,
+        working_image.height,
+        working_image.rgba,
+    )
+}
+
 fn tone_map_hdr_still_image(bytes: &[u8], format: image::ImageFormat) -> Result<RgbaImage> {
     let image = image::load_from_memory_with_format(bytes, format)?;
     let (width, height) = image.dimensions();
-    let mut linear_rgba = image.into_rgba32f().into_raw();
+    let rendered = tone_map_linear_rgba_to_sdr_rgba(width, height, image.into_rgba32f().into_raw())?;
 
-    hdr_sdr_tone_mapper()?
+    Ok(rgba_image_to_bgra(rendered))
+}
+
+fn tone_map_linear_rgba_to_sdr_rgba(
+    width: u32,
+    height: u32,
+    mut linear_rgba: Vec<f32>,
+) -> Result<RgbaImage> {
+    scene_linear_sdr_tone_mapper()?
         .tonemap_linearized_lane(&mut linear_rgba)
         .map_err(|error| anyhow::anyhow!("gainforge tone mapping failed: {error}"))?;
 
-    let mut bgra = Vec::with_capacity(linear_rgba.len());
+    let mut rgba = Vec::with_capacity(linear_rgba.len());
     for pixel in linear_rgba.chunks_exact(4) {
-        bgra.push(linear_to_srgb_u8(pixel[2]));
-        bgra.push(linear_to_srgb_u8(pixel[1]));
-        bgra.push(linear_to_srgb_u8(pixel[0]));
-        bgra.push(linear_alpha_to_u8(pixel[3]));
+        rgba.push(linear_to_srgb_u8(pixel[0]));
+        rgba.push(linear_to_srgb_u8(pixel[1]));
+        rgba.push(linear_to_srgb_u8(pixel[2]));
+        rgba.push(linear_alpha_to_u8(pixel[3]));
     }
 
-    ImageBuffer::from_raw(width, height, bgra)
+    ImageBuffer::from_raw(width, height, rgba)
         .context("tone-mapped HDR image dimensions did not match output buffer")
 }
 
-fn hdr_sdr_tone_mapper() -> Result<Arc<dyn gainforge::ToneMapper<u16> + Send + Sync>> {
+fn rgba_image_to_bgra(mut image: RgbaImage) -> RgbaImage {
+    for pixel in image.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+
+    image
+}
+
+fn scene_linear_sdr_tone_mapper() -> Result<Arc<dyn gainforge::ToneMapper<u16> + Send + Sync>> {
     static TONE_MAPPER: OnceLock<
         Result<Arc<dyn gainforge::ToneMapper<u16> + Send + Sync>, String>,
     > = OnceLock::new();
@@ -2029,7 +2072,7 @@ fn hdr_sdr_tone_mapper() -> Result<Arc<dyn gainforge::ToneMapper<u16> + Send + S
     tone_mapper
         .as_ref()
         .map(Arc::clone)
-        .map_err(|error| anyhow::anyhow!("failed to create HDR tone mapper: {error}"))
+        .map_err(|error| anyhow::anyhow!("failed to create scene-linear SDR tone mapper: {error}"))
 }
 
 fn linear_to_srgb_u8(linear: f32) -> u8 {
@@ -2116,6 +2159,129 @@ mod tests {
             .write_to(&mut bytes, image::ImageFormat::OpenExr)
             .expect("write test exr");
         bytes.into_inner()
+    }
+
+    fn exr_fixture(width: u32, height: u32, pixels: Vec<[f32; 4]>) -> Vec<u8> {
+        let image = DynamicImage::ImageRgba32F(
+            ImageBuffer::from_fn(width, height, |x, y| {
+                let index = (y * width + x) as usize;
+                Rgba(pixels[index])
+            }),
+        );
+        let mut bytes = Cursor::new(Vec::new());
+        image
+            .write_to(&mut bytes, image::ImageFormat::OpenExr)
+            .expect("write test exr fixture");
+        bytes.into_inner()
+    }
+
+    fn single_pixel_hdr(pixel: [f32; 3]) -> Vec<u8> {
+        let image = DynamicImage::ImageRgb32F(ImageBuffer::from_pixel(1, 1, image::Rgb(pixel)));
+        let mut bytes = Cursor::new(Vec::new());
+        image
+            .write_to(&mut bytes, image::ImageFormat::Hdr)
+            .expect("write test hdr");
+        bytes.into_inner()
+    }
+
+    fn bgra_bytes_to_rgba(bytes: &[u8]) -> Vec<u8> {
+        let mut rgba = bytes.to_vec();
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+        rgba
+    }
+
+    #[test]
+    fn decode_exr_to_working_rgba_preserves_dimensions_and_linear_channels() {
+        let exr_bytes = exr_fixture(
+            2,
+            1,
+            vec![
+                [0.18, 0.5, 4.0, 0.75],
+                [1.0, 0.25, 0.0, 1.0],
+            ],
+        );
+
+        let working_image = decode_exr_to_working_rgba(&exr_bytes).expect("decode EXR");
+
+        assert_eq!(working_image.width, 2);
+        assert_eq!(working_image.height, 1);
+        assert_eq!(working_image.rgba.len(), 8);
+
+        let expected: [f32; 8] = [0.18, 0.5, 4.0, 0.75, 1.0, 0.25, 0.0, 1.0];
+        for (actual, expected) in working_image.rgba.iter().zip(expected) {
+            assert!(
+                (*actual - expected).abs() < 1e-6,
+                "expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_exr_to_working_rgba_matches_control_decode_without_hidden_display_transform() {
+        let exr_bytes = single_pixel_exr([0.5, 0.25, 4.0, 1.0]);
+        let control = image::load_from_memory_with_format(&exr_bytes, image::ImageFormat::OpenExr)
+            .expect("decode EXR control image")
+            .into_rgba32f();
+
+        let working_image = decode_exr_to_working_rgba(&exr_bytes).expect("decode EXR");
+
+        assert_eq!(working_image.width, control.width());
+        assert_eq!(working_image.height, control.height());
+        for (actual, expected) in working_image.rgba.iter().zip(control.as_raw()) {
+            assert!(
+                (*actual - *expected).abs() < 1e-6,
+                "expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_exr_to_sdr_rgba_returns_decodable_sdr_output_with_preserved_dimensions_and_alpha() {
+        let exr_bytes = exr_fixture(1, 1, vec![[0.5, 0.25, 4.0, 0.75]]);
+
+        let rendered = render_exr_to_sdr_rgba(&exr_bytes).expect("render EXR to SDR");
+
+        assert_eq!(rendered.dimensions(), (1, 1));
+        let pixel = rendered.get_pixel(0, 0).0;
+        assert!(pixel[0] > 128, "expected tone-mapped red channel, got {}", pixel[0]);
+        assert!(
+            pixel[1] > 64,
+            "expected display-encoded green channel, got {}",
+            pixel[1]
+        );
+        assert!(
+            pixel[2] < 255,
+            "expected HDR blue highlight to be tone-mapped, got {}",
+            pixel[2]
+        );
+        assert_eq!(pixel[3], 191);
+    }
+
+    #[test]
+    fn exr_still_image_render_matches_shared_sdr_render_helper() {
+        let exr_bytes = single_pixel_exr([1.0, 0.5, 0.25, 1.0]);
+        let image = Image::from_bytes(ImageFormat::Exr, exr_bytes.clone());
+        let svg_renderer = SvgRenderer::new(Arc::new(()));
+
+        let render_image = image.to_image_data(svg_renderer).expect("decode exr");
+        let render_bytes = render_image.as_bytes(0).expect("rendered frame bytes");
+        let rendered = render_exr_to_sdr_rgba(&exr_bytes).expect("render EXR to SDR");
+
+        assert_eq!(bgra_bytes_to_rgba(render_bytes), rendered.as_raw().as_slice());
+    }
+
+    #[test]
+    fn hdr_still_image_render_keeps_existing_hdr_path() {
+        let hdr_bytes = single_pixel_hdr([0.5, 0.25, 4.0]);
+        let frames =
+            render_still_image_frames(&hdr_bytes, image::ImageFormat::Hdr).expect("render HDR");
+        let expected = tone_map_hdr_still_image(&hdr_bytes, image::ImageFormat::Hdr)
+            .expect("tone map HDR");
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].buffer().as_raw(), expected.as_raw());
     }
 
     #[test]
