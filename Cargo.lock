@@ -6804,6 +6804,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gainforge"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f2ada1dee0383a301c34cca4de8566bc600303712f7a94be3283850819eca1c"
+dependencies = [
+ "moxcms 0.8.1",
+ "num-traits",
+ "pxfm",
+]
+
+[[package]]
 name = "gaoya"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7593,6 +7604,7 @@ dependencies = [
  "foreign-types 0.5.0",
  "futures 0.3.31",
  "futures-concurrency",
+ "gainforge",
  "getrandom 0.3.4",
  "gpui_macros",
  "gpui_platform",
@@ -7607,6 +7619,7 @@ dependencies = [
  "mach2 0.5.0",
  "media",
  "metal",
+ "moxcms 0.8.1",
  "naga 28.0.0",
  "num_cpus",
  "objc",
@@ -7668,6 +7681,7 @@ dependencies = [
  "gpui",
  "gpui_wgpu",
  "http_client",
+ "image",
  "itertools 0.14.0",
  "libc",
  "log",
@@ -8614,7 +8628,7 @@ dependencies = [
  "exr",
  "gif",
  "image-webp",
- "moxcms",
+ "moxcms 0.7.7",
  "num-traits",
  "png 0.18.0",
  "qoi",
@@ -8644,16 +8658,20 @@ dependencies = [
  "db",
  "editor",
  "file_icons",
+ "fs",
  "gpui",
  "language",
  "log",
  "project",
  "serde",
+ "serde_json",
  "settings",
  "theme",
  "ui",
  "util",
  "workspace",
+ "worktree",
+ "zlog",
 ]
 
 [[package]]
@@ -10654,6 +10672,16 @@ name = "moxcms"
 version = "0.7.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c588e11a3082784af229e23e8e4ecf5bcc6fbe4f69101e0421ce8d79da7f0b40"
+dependencies = [
+ "num-traits",
+ "pxfm",
+]
+
+[[package]]
+name = "moxcms"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
 dependencies = [
  "num-traits",
  "pxfm",
@@ -13068,6 +13096,7 @@ dependencies = [
  "aho-corasick",
  "anyhow",
  "askpass",
+ "async-tar",
  "async-trait",
  "base64 0.22.1",
  "buffer_diff",

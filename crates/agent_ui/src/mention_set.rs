@@ -226,7 +226,9 @@ impl MentionSet {
             let image = cx
                 .spawn(async move |_, cx| {
                     let image = image_task.await.map_err(|e| e.to_string())?;
-                    let image = image.update(cx, |image, _| image.image.clone());
+                    let image = project::ImageItem::wait_for_renderable_image(image, cx)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     Ok(image)
                 })
                 .shared();
@@ -359,7 +361,7 @@ impl MentionSet {
             let task = project.update(cx, |project, cx| project.open_image(project_path, cx));
             return cx.spawn(async move |_, cx| {
                 let image = task.await?;
-                let image = image.update(cx, |image, _| image.image.clone());
+                let image = project::ImageItem::wait_for_renderable_image(image, cx).await?;
                 let image = cx
                     .update(|cx| LanguageModelImage::from_image(image, cx))
                     .await;
@@ -829,6 +831,7 @@ pub(crate) fn paste_images_as_context(
                                 image::ImageFormat::Bmp => gpui::ImageFormat::Bmp,
                                 image::ImageFormat::Tiff => gpui::ImageFormat::Tiff,
                                 image::ImageFormat::Ico => gpui::ImageFormat::Ico,
+                                image::ImageFormat::OpenExr => gpui::ImageFormat::Exr,
                                 _ => continue,
                             },
                             content,

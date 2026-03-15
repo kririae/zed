@@ -102,6 +102,7 @@ ztracing.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+async-tar.workspace = true
 client = { workspace = true, features = ["test-support"] }
 encoding_rs.workspace = true
 collections = { workspace = true, features = ["test-support"] }

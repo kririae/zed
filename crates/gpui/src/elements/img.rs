@@ -2,7 +2,8 @@ use crate::{
     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
     Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
     Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
-    SharedString, SharedUri, StyleRefinement, Styled, Task, Window, px,
+    SharedString, SharedUri, StyleRefinement, Styled, Task, Window,
+    platform::render_still_image_frames, px,
 };
 use anyhow::Result;
 
@@ -681,17 +682,7 @@ impl Asset for ImageAssetLoader {
                             SmallVec::from_elem(Frame::new(data), 1)
                         }
                     }
-                    _ => {
-                        let mut data =
-                            image::load_from_memory_with_format(&bytes, format)?.into_rgba8();
-
-                        // Convert from RGBA to BGRA.
-                        for pixel in data.chunks_exact_mut(4) {
-                            pixel.swap(0, 2);
-                        }
-
-                        SmallVec::from_elem(Frame::new(data), 1)
-                    }
+                    _ => render_still_image_frames(&bytes, format)?,
                 };
 
                 Ok(Arc::new(RenderImage::new(data)))

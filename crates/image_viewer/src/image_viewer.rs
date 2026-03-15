@@ -12,12 +12,12 @@ use gpui::{
     AnyElement, App, Bounds, Context, DispatchPhase, Element, ElementId, Entity, EventEmitter,
     FocusHandle, Focusable, GlobalElementId, InspectorElementId, InteractiveElement, IntoElement,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Point, Render, ScrollDelta, ScrollWheelEvent, Style, Styled, Task, WeakEntity, Window, actions,
-    checkerboard, div, img, point, px, size,
+    Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Style, Styled, Task, WeakEntity,
+    Window, actions, checkerboard, div, img, point, px, size,
 };
 use language::File as _;
 use persistence::IMAGE_VIEWER;
-use project::{ImageItem, Project, ProjectPath, image_store::ImageItemEvent};
+use project::{ImageItem, ImageLoadState, Project, ProjectPath, image_store::ImageItemEvent};
 use settings::Settings;
 use theme::ThemeSettings;
 use ui::{Tooltip, prelude::*};
@@ -65,9 +65,32 @@ pub struct ImageView {
     image_size: Option<(u32, u32)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ImageContentState {
+    Loading,
+    Loaded,
+    Failed(SharedString),
+}
+
 impl ImageView {
     fn is_dragging(&self) -> bool {
         self.last_mouse_position.is_some()
+    }
+
+    fn content_state_for_item(image_item: &Entity<ImageItem>, cx: &App) -> ImageContentState {
+        let item = image_item.read(cx);
+        if item.image.is_some() {
+            return ImageContentState::Loaded;
+        }
+        match &item.load_state {
+            ImageLoadState::Loading => ImageContentState::Loading,
+            ImageLoadState::Failed(message) => ImageContentState::Failed(message.clone()),
+            ImageLoadState::Loaded => ImageContentState::Loaded,
+        }
+    }
+
+    fn content_state(&self, cx: &App) -> ImageContentState {
+        Self::content_state_for_item(&self.image_item, cx)
     }
 
     pub fn new(
@@ -79,16 +102,21 @@ impl ImageView {
         // Start loading the image to render in the background to prevent the view
         // from flickering in most cases.
         let _ = image_item.update(cx, |image, cx| {
-            image.image.clone().get_render_image(window, cx)
+            image
+                .image
+                .clone()
+                .and_then(|image| image.get_render_image(window, cx))
         });
 
         cx.subscribe(&image_item, Self::on_image_event).detach();
         cx.on_release_in(window, |this, window, cx| {
             let image_data = this.image_item.read(cx).image.clone();
-            if let Some(image) = image_data.clone().get_render_image(window, cx) {
-                cx.drop_image(image, None);
+            if let Some(image_data) = image_data {
+                if let Some(image) = image_data.clone().get_render_image(window, cx) {
+                    cx.drop_image(image, None);
+                }
+                image_data.remove_asset(cx);
             }
-            image_data.remove_asset(cx);
         })
         .detach();
 
@@ -116,7 +144,8 @@ impl ImageView {
         cx: &mut Context<Self>,
     ) {
         match event {
-            ImageItemEvent::MetadataUpdated
+            ImageItemEvent::LoadStateChanged
+            | ImageItemEvent::MetadataUpdated
             | ImageItemEvent::FileHandleChanged
             | ImageItemEvent::Reloaded => {
                 self.image_size = self
@@ -330,7 +359,58 @@ impl Element for ImageContentElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let image_view = self.image_view.read(cx);
-        let image = image_view.image_item.read(cx).image.clone();
+        let content_state = image_view.content_state(cx);
+        let file_name = image_view
+            .image_item
+            .read(cx)
+            .file
+            .file_name(cx)
+            .to_string();
+        let is_dragging = image_view.is_dragging();
+
+        match content_state {
+            ImageContentState::Loading => {
+                let mut placeholder = v_flex()
+                    .size_full()
+                    .justify_center()
+                    .items_center()
+                    .gap_2()
+                    .child(LoadingLabel::new("Opening image"))
+                    .child(Label::new(file_name).color(Color::Muted))
+                    .into_any_element();
+
+                placeholder.prepaint_as_root(bounds.origin, bounds.size.into(), window, cx);
+                return Some((placeholder, is_dragging));
+            }
+            ImageContentState::Failed(message) => {
+                let mut placeholder = v_flex()
+                    .size_full()
+                    .justify_center()
+                    .items_center()
+                    .gap_2()
+                    .child(Label::new("Failed to open image"))
+                    .child(Label::new(message).color(Color::Muted))
+                    .into_any_element();
+
+                placeholder.prepaint_as_root(bounds.origin, bounds.size.into(), window, cx);
+                return Some((placeholder, is_dragging));
+            }
+            ImageContentState::Loaded => {}
+        }
+
+        let Some(image) = image_view.image_item.read(cx).image.clone() else {
+            let mut placeholder = v_flex()
+                .size_full()
+                .justify_center()
+                .items_center()
+                .gap_2()
+                .child(Label::new("Failed to open image"))
+                .child(Label::new("Image data is unavailable").color(Color::Muted))
+                .into_any_element();
+
+            placeholder.prepaint_as_root(bounds.origin, bounds.size.into(), window, cx);
+            return Some((placeholder, is_dragging));
+        };
 
         let first_layout = image_view.container_bounds.is_none();
 
@@ -346,8 +426,6 @@ impl Element for ImageContentElement {
 
         let pan_offset = image_view.pan_offset;
         let border_color = cx.theme().colors().border;
-
-        let is_dragging = image_view.is_dragging();
 
         let scaled_size = image_view
             .image_size
@@ -398,11 +476,11 @@ impl Element for ImageContentElement {
                             .border_1()
                             .border_color(border_color),
                     )
-                    .child({
+                    .child(
                         img(image)
                             .id(("image-viewer-image", self.image_view.entity_id()))
-                            .size_full()
-                    }),
+                            .size_full(),
+                    ),
             )
             .into_any_element();
 
@@ -877,6 +955,121 @@ impl ToolbarItemView for ImageViewToolbarControls {
 pub fn init(cx: &mut App) {
     workspace::register_project_item::<ImageView>(cx);
     workspace::register_serializable_item::<ImageView>(cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fs::FakeFs;
+    use gpui::TestAppContext;
+    use project::{ImageId, ImageItem, ImageLoadState, Project};
+    use serde_json::json;
+    use std::num::NonZeroU64;
+    use std::sync::Arc;
+    use util::rel_path::rel_path;
+    use worktree::File as WorktreeFile;
+
+    fn init_test(cx: &mut TestAppContext) {
+        zlog::init_test();
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+    }
+
+    async fn placeholder_image_view(
+        load_state: ImageLoadState,
+        image: Option<Arc<gpui::Image>>,
+        cx: &mut TestAppContext,
+    ) -> Entity<ImageView> {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/root", json!({})).await;
+
+        let project = Project::test(fs, ["/root".as_ref()], cx).await;
+        let worktree = cx.update(|cx| project.read(cx).worktrees(cx).next().unwrap().clone());
+        let file = Arc::new(WorktreeFile {
+            worktree,
+            path: rel_path("image_1.png").into(),
+            disk_state: language::DiskState::New,
+            entry_id: None,
+            is_local: true,
+            is_private: false,
+        });
+
+        let image_item = cx.new(|_cx| ImageItem {
+            id: ImageId::from(NonZeroU64::new(1).expect("1 is non-zero")),
+            file,
+            image,
+            load_task: None,
+            image_metadata: None,
+            load_state,
+        });
+
+        cx.new(|cx| ImageView {
+            image_item,
+            project,
+            focus_handle: cx.focus_handle(),
+            zoom_level: 1.0,
+            pan_offset: Point::default(),
+            last_mouse_position: None,
+            container_bounds: None,
+            image_size: None,
+        })
+    }
+
+    #[gpui::test]
+    async fn test_content_state_is_loading_for_placeholder_item(cx: &mut TestAppContext) {
+        let image_view = placeholder_image_view(ImageLoadState::Loading, None, cx).await;
+
+        let content_state = cx.update(|cx| image_view.read(cx).content_state(cx));
+
+        assert_eq!(content_state, ImageContentState::Loading);
+    }
+
+    #[gpui::test]
+    async fn test_content_state_is_failed_when_item_has_error(cx: &mut TestAppContext) {
+        let image_view = placeholder_image_view(
+            ImageLoadState::Failed("decode failed".into()),
+            None,
+            cx,
+        )
+        .await;
+
+        let content_state = cx.update(|cx| image_view.read(cx).content_state(cx));
+
+        assert_eq!(
+            content_state,
+            ImageContentState::Failed("decode failed".into())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_content_state_stays_loaded_while_existing_image_reloads(
+        cx: &mut TestAppContext,
+    ) {
+        let image_view = placeholder_image_view(
+            ImageLoadState::Loading,
+            Some(Arc::new(gpui::Image::from_bytes(
+                gpui::ImageFormat::Png,
+                vec![
+                    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+                    0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+                    0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
+                    0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+                    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+                    0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+                ],
+            ))),
+            cx,
+        )
+        .await;
+
+        let content_state = cx.update(|cx| image_view.read(cx).content_state(cx));
+
+        assert_eq!(content_state, ImageContentState::Loaded);
+    }
 }
 
 mod persistence {

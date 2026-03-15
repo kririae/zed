@@ -219,8 +219,10 @@ impl AgentTool for ReadFileTool {
                     })
                     .await.map_err(tool_content_err)?;
 
-                let image =
-                    image_entity.read_with(cx, |image_item, _| Arc::clone(&image_item.image));
+                let image = ImageItem::wait_for_renderable_image(image_entity, cx)
+                    .await
+                    .context("waiting for image to load")
+                    .map_err(tool_content_err)?;
 
                 let language_model_image = cx
                     .update(|cx| LanguageModelImage::from_image(image, cx))

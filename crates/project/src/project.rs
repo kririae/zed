@@ -78,7 +78,7 @@ use futures::{
     channel::mpsc::{self, UnboundedReceiver},
     future::try_join_all,
 };
-pub use image_store::{ImageItem, ImageStore};
+pub use image_store::{ImageId, ImageItem, ImageLoadState, ImageStore};
 use image_store::{ImageItemEvent, ImageStoreEvent};
 
 use ::git::{blame::Blame, status::FileStatus};
@@ -3155,29 +3155,8 @@ impl Project {
             return Task::ready(Err(anyhow!(ErrorCode::Disconnected)));
         }
 
-        let open_image_task = self.image_store.update(cx, |image_store, cx| {
+        self.image_store.update(cx, |image_store, cx| {
             image_store.open_image(path.into(), cx)
-        });
-
-        let weak_project = cx.entity().downgrade();
-        cx.spawn(async move |_, cx| {
-            let image_item = open_image_task.await?;
-
-            // Check if metadata already exists (e.g., for remote images)
-            let needs_metadata =
-                cx.read_entity(&image_item, |item, _| item.image_metadata.is_none());
-
-            if needs_metadata {
-                let project = weak_project.upgrade().context("Project dropped")?;
-                let metadata =
-                    ImageItem::load_image_metadata(image_item.clone(), project, cx).await?;
-                image_item.update(cx, |image_item, cx| {
-                    image_item.image_metadata = Some(metadata);
-                    cx.emit(ImageItemEvent::MetadataUpdated);
-                });
-            }
-
-            Ok(image_item)
         })
     }
 

@@ -47,7 +47,8 @@ use x11rb::{
     wrapper::ConnectionExt as _,
 };
 
-use gpui::{ClipboardItem, Image, ImageFormat, SvgRenderer, hash};
+use gpui::{ClipboardItem, Image, ImageFormat, hash};
+use image::ImageEncoder as _;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -953,142 +954,20 @@ fn prepare_image_for_clipboard(image: &Image) -> Result<Image> {
         return Ok(image.clone());
     }
 
-    let render_image = image
-        .to_image_data(SvgRenderer::new(Arc::new(())))
+    let rgba = image::load_from_memory_with_format(&image.bytes, image::ImageFormat::OpenExr)
+        .map_err(|_| Error::ConversionFailure)?
+        .into_rgba8();
+    let mut png_bytes = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png_bytes)
+        .write_image(
+            rgba.as_raw(),
+            rgba.width(),
+            rgba.height(),
+            image::ExtendedColorType::Rgba8,
+        )
         .map_err(|_| Error::ConversionFailure)?;
 
-    if render_image.frame_count() == 0 {
-        return Err(Error::ConversionFailure);
-    }
-
-    let size = render_image.size(0);
-    let width = u32::try_from(size.width.0).map_err(|_| Error::ConversionFailure)?;
-    let height = u32::try_from(size.height.0).map_err(|_| Error::ConversionFailure)?;
-    let png_bytes = encode_png_bytes_from_bgra(
-        render_image.as_bytes(0).ok_or(Error::ConversionFailure)?,
-        width,
-        height,
-    )?;
-
     Ok(Image::from_bytes(ImageFormat::Png, png_bytes))
-}
-
-fn encode_png_bytes_from_bgra(bgra_bytes: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
-    let width = usize::try_from(width).map_err(|_| Error::ConversionFailure)?;
-    let height = usize::try_from(height).map_err(|_| Error::ConversionFailure)?;
-    let row_byte_count = width.checked_mul(4).ok_or(Error::ConversionFailure)?;
-    let expected_len = row_byte_count
-        .checked_mul(height)
-        .ok_or(Error::ConversionFailure)?;
-
-    if bgra_bytes.len() != expected_len {
-        return Err(Error::ConversionFailure);
-    }
-
-    let filtered_len = expected_len
-        .checked_add(height)
-        .ok_or(Error::ConversionFailure)?;
-    let mut filtered_bytes = Vec::with_capacity(filtered_len);
-    for row in bgra_bytes.chunks_exact(row_byte_count) {
-        filtered_bytes.push(0);
-        for pixel in row.chunks_exact(4) {
-            filtered_bytes.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
-        }
-    }
-
-    encode_png_bytes(width as u32, height as u32, &filtered_bytes)
-}
-
-fn encode_png_bytes_from_rgba(rgba_bytes: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
-    let width = usize::try_from(width).map_err(|_| Error::ConversionFailure)?;
-    let height = usize::try_from(height).map_err(|_| Error::ConversionFailure)?;
-    let row_byte_count = width.checked_mul(4).ok_or(Error::ConversionFailure)?;
-    let expected_len = row_byte_count
-        .checked_mul(height)
-        .ok_or(Error::ConversionFailure)?;
-
-    if rgba_bytes.len() != expected_len {
-        return Err(Error::ConversionFailure);
-    }
-
-    let filtered_len = expected_len
-        .checked_add(height)
-        .ok_or(Error::ConversionFailure)?;
-    let mut filtered_bytes = Vec::with_capacity(filtered_len);
-    for row in rgba_bytes.chunks_exact(row_byte_count) {
-        filtered_bytes.push(0);
-        filtered_bytes.extend_from_slice(row);
-    }
-
-    encode_png_bytes(width as u32, height as u32, &filtered_bytes)
-}
-
-fn encode_png_bytes(width: u32, height: u32, filtered_bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut png_bytes = Vec::new();
-    png_bytes.extend_from_slice(b"\x89PNG\r\n\x1a\n");
-
-    let mut ihdr = Vec::with_capacity(13);
-    ihdr.extend_from_slice(&width.to_be_bytes());
-    ihdr.extend_from_slice(&height.to_be_bytes());
-    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
-    append_png_chunk(&mut png_bytes, *b"IHDR", &ihdr);
-
-    let mut idat = Vec::new();
-    idat.extend_from_slice(&[0x78, 0x01]);
-
-    let mut remaining_bytes = filtered_bytes;
-    while !remaining_bytes.is_empty() {
-        let chunk_len = remaining_bytes.len().min(u16::MAX as usize);
-        let is_final_chunk = chunk_len == remaining_bytes.len();
-        idat.push(u8::from(is_final_chunk));
-
-        let chunk_len = u16::try_from(chunk_len).map_err(|_| Error::ConversionFailure)?;
-        idat.extend_from_slice(&chunk_len.to_le_bytes());
-        idat.extend_from_slice(&(!chunk_len).to_le_bytes());
-        idat.extend_from_slice(&remaining_bytes[..usize::from(chunk_len)]);
-        remaining_bytes = &remaining_bytes[usize::from(chunk_len)..];
-    }
-
-    idat.extend_from_slice(&adler32(filtered_bytes).to_be_bytes());
-    append_png_chunk(&mut png_bytes, *b"IDAT", &idat);
-    append_png_chunk(&mut png_bytes, *b"IEND", &[]);
-
-    Ok(png_bytes)
-}
-
-fn append_png_chunk(png_bytes: &mut Vec<u8>, chunk_type: [u8; 4], data: &[u8]) {
-    png_bytes.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    png_bytes.extend_from_slice(&chunk_type);
-    png_bytes.extend_from_slice(data);
-
-    let mut crc_input = Vec::with_capacity(chunk_type.len() + data.len());
-    crc_input.extend_from_slice(&chunk_type);
-    crc_input.extend_from_slice(data);
-    png_bytes.extend_from_slice(&crc32(&crc_input).to_be_bytes());
-}
-
-fn adler32(bytes: &[u8]) -> u32 {
-    const MOD_ADLER: u32 = 65_521;
-
-    let mut a = 1_u32;
-    let mut b = 0_u32;
-    for byte in bytes {
-        a = (a + u32::from(*byte)) % MOD_ADLER;
-        b = (b + a) % MOD_ADLER;
-    }
-    (b << 16) | a
-}
-
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffff_u32;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg() & 0xedb8_8320;
-            crc = (crc >> 1) ^ mask;
-        }
-    }
-    !crc
 }
 
 impl Clipboard {
@@ -1419,117 +1298,10 @@ impl Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{DynamicImage, ImageBuffer, Rgba};
 
-    mod image {
-        use super::{Error, encode_png_bytes_from_rgba};
-        use std::io::{Error as IoError, Result as IoResult, Write};
-
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-        pub enum ImageFormat {
-            Png,
-            OpenExr,
-        }
-
-        #[derive(Clone)]
-        pub struct ImageBuffer<T> {
-            width: u32,
-            height: u32,
-            pixel: T,
-        }
-
-        impl<T: Clone> ImageBuffer<T> {
-            pub fn from_pixel(width: u32, height: u32, pixel: T) -> Self {
-                Self {
-                    width,
-                    height,
-                    pixel,
-                }
-            }
-        }
-
-        #[derive(Clone, Copy)]
-        pub struct Rgba<T>(pub [T; 4]);
-
-        pub enum DynamicImage {
-            ImageRgba8(ImageBuffer<Rgba<u8>>),
-            ImageRgba32F(ImageBuffer<Rgba<f32>>),
-        }
-
-        impl DynamicImage {
-            pub fn write_to<W: Write>(&self, writer: &mut W, format: ImageFormat) -> IoResult<()> {
-                match (self, format) {
-                    (Self::ImageRgba8(image), ImageFormat::Png) => {
-                        let mut rgba_bytes = Vec::with_capacity(
-                            image.width as usize * image.height as usize * image.pixel.0.len(),
-                        );
-                        for _ in 0..(image.width as usize * image.height as usize) {
-                            rgba_bytes.extend_from_slice(&image.pixel.0);
-                        }
-
-                        let png_bytes = encode_png_bytes_from_rgba(
-                            &rgba_bytes,
-                            image.width,
-                            image.height,
-                        )
-                        .map_err(|_| IoError::other("png encoding failed"))?;
-                        writer.write_all(&png_bytes)
-                    }
-                    (Self::ImageRgba32F(image), ImageFormat::OpenExr)
-                        if image.width == 1
-                            && image.height == 1
-                            && image.pixel.0 == [1.0, 1.0, 1.0, 1.0] =>
-                    {
-                        writer.write_all(SINGLE_PIXEL_EXR_BYTES)
-                    }
-                    _ => Err(IoError::other("unsupported fixture image")),
-                }
-            }
-        }
-
-        pub fn guess_format(bytes: &[u8]) -> Result<ImageFormat, Error> {
-            if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-                return Ok(ImageFormat::Png);
-            }
-
-            Err(Error::ConversionFailure)
-        }
-
-        const SINGLE_PIXEL_EXR_BYTES: &[u8] = &[
-            0x76, 0x2f, 0x31, 0x01, 0x02, 0x00, 0x00, 0x00, 0x63, 0x68, 0x61, 0x6e, 0x6e,
-            0x65, 0x6c, 0x73, 0x00, 0x63, 0x68, 0x6c, 0x69, 0x73, 0x74, 0x00, 0x37, 0x00,
-            0x00, 0x00, 0x42, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x47, 0x00, 0x01, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x52,
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
-            0x01, 0x00, 0x00, 0x00, 0x00, 0x63, 0x6f, 0x6d, 0x70, 0x72, 0x65, 0x73, 0x73,
-            0x69, 0x6f, 0x6e, 0x00, 0x63, 0x6f, 0x6d, 0x70, 0x72, 0x65, 0x73, 0x73, 0x69,
-            0x6f, 0x6e, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x64, 0x61, 0x74, 0x61, 0x57,
-            0x69, 0x6e, 0x64, 0x6f, 0x77, 0x00, 0x62, 0x6f, 0x78, 0x32, 0x69, 0x00, 0x10,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x69, 0x73, 0x70, 0x6c, 0x61, 0x79,
-            0x57, 0x69, 0x6e, 0x64, 0x6f, 0x77, 0x00, 0x62, 0x6f, 0x78, 0x32, 0x69, 0x00,
-            0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6c, 0x69, 0x6e, 0x65, 0x4f, 0x72,
-            0x64, 0x65, 0x72, 0x00, 0x6c, 0x69, 0x6e, 0x65, 0x4f, 0x72, 0x64, 0x65, 0x72,
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x70, 0x69, 0x78, 0x65, 0x6c, 0x41, 0x73,
-            0x70, 0x65, 0x63, 0x74, 0x52, 0x61, 0x74, 0x69, 0x6f, 0x00, 0x66, 0x6c, 0x6f,
-            0x61, 0x74, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3f, 0x73, 0x63,
-            0x72, 0x65, 0x65, 0x6e, 0x57, 0x69, 0x6e, 0x64, 0x6f, 0x77, 0x43, 0x65, 0x6e,
-            0x74, 0x65, 0x72, 0x00, 0x76, 0x32, 0x66, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x73, 0x63, 0x72, 0x65, 0x65, 0x6e,
-            0x57, 0x69, 0x6e, 0x64, 0x6f, 0x77, 0x57, 0x69, 0x64, 0x74, 0x68, 0x00, 0x66,
-            0x6c, 0x6f, 0x61, 0x74, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3f,
-            0x00, 0x41, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x06, 0x00, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c,
-        ];
-    }
-
-    fn single_pixel_exr_bytes() -> Vec<u8> {
-        let image = image::DynamicImage::ImageRgba32F(image::ImageBuffer::from_pixel(
-            1,
-            1,
-            image::Rgba([1.0_f32, 1.0_f32, 1.0_f32, 1.0_f32]),
-        ));
+    fn single_pixel_exr_bytes(pixel: [f32; 4]) -> Vec<u8> {
+        let image = DynamicImage::ImageRgba32F(ImageBuffer::from_pixel(1, 1, Rgba(pixel)));
         let mut bytes = std::io::Cursor::new(Vec::new());
         image
             .write_to(&mut bytes, image::ImageFormat::OpenExr)
@@ -1537,35 +1309,45 @@ mod tests {
         bytes.into_inner()
     }
 
-    fn single_pixel_png_bytes() -> Vec<u8> {
-        let image = image::DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
-            1,
-            1,
-            image::Rgba([255_u8, 255_u8, 255_u8, 255_u8]),
-        ));
-        let mut bytes = std::io::Cursor::new(Vec::new());
-        image
-            .write_to(&mut bytes, image::ImageFormat::Png)
-            .expect("writing 1x1 PNG fixture should succeed");
-        bytes.into_inner()
-    }
-
     #[test]
-    fn test_prepare_exr_image_for_clipboard_transcodes_to_png() {
-        let exr = Image::from_bytes(ImageFormat::Exr, single_pixel_exr_bytes());
+    fn test_prepare_exr_image_for_clipboard_transcodes_to_decodable_png() {
+        let exr_bytes = single_pixel_exr_bytes([1.0_f32, 0.5_f32, 0.25_f32, 1.0_f32]);
+        let expected_pixel =
+            image::load_from_memory_with_format(&exr_bytes, image::ImageFormat::OpenExr)
+                .expect("generated EXR should decode")
+                .into_rgba8()
+                .get_pixel(0, 0)
+                .0;
+        let exr = Image::from_bytes(ImageFormat::Exr, exr_bytes);
 
         let prepared = prepare_image_for_clipboard(&exr).unwrap();
+        let decoded_png =
+            image::load_from_memory_with_format(&prepared.bytes, image::ImageFormat::Png)
+                .expect("transcoded clipboard payload should decode as PNG")
+                .into_rgba8();
 
         assert_eq!(prepared.format, ImageFormat::Png);
+        assert!(prepared.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert_eq!(
             image::guess_format(&prepared.bytes).unwrap(),
             image::ImageFormat::Png
         );
+        assert_eq!(decoded_png.dimensions(), (1, 1));
+        assert_ne!(expected_pixel, [255, 255, 255, 255]);
+        assert_eq!(decoded_png.get_pixel(0, 0).0, expected_pixel);
     }
 
     #[test]
     fn test_prepare_png_image_for_clipboard_is_passthrough() {
-        let png = Image::from_bytes(ImageFormat::Png, single_pixel_png_bytes());
+        let mut png_cursor = std::io::Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(ImageBuffer::from_pixel(
+            1,
+            1,
+            Rgba([255_u8, 255_u8, 255_u8, 255_u8]),
+        ))
+        .write_to(&mut png_cursor, image::ImageFormat::Png)
+        .expect("writing 1x1 PNG fixture should succeed");
+        let png = Image::from_bytes(ImageFormat::Png, png_cursor.into_inner());
 
         let prepared = prepare_image_for_clipboard(&png).unwrap();
 

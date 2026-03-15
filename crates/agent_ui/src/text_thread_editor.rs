@@ -1913,6 +1913,7 @@ impl TextThreadEditor {
                         image::ImageFormat::Bmp => gpui::ImageFormat::Bmp,
                         image::ImageFormat::Tiff => gpui::ImageFormat::Tiff,
                         image::ImageFormat::Ico => gpui::ImageFormat::Ico,
+                        image::ImageFormat::OpenExr => gpui::ImageFormat::Exr,
                         _ => continue,
                     },
                     content,

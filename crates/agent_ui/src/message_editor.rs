@@ -1176,6 +1176,7 @@ impl MessageEditor {
                     ("tiff", gpui::ImageFormat::Tiff),
                     ("tif", gpui::ImageFormat::Tiff),
                     ("ico", gpui::ImageFormat::Ico),
+                    ("exr", gpui::ImageFormat::Exr),
                 ];
 
                 let mut images = Vec::new();

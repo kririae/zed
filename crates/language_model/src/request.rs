@@ -118,6 +118,11 @@ impl LanguageModelImage {
                     .and_then(image::DynamicImage::from_decoder),
                 ImageFormat::Tiff => image::codecs::tiff::TiffDecoder::new(image_bytes)
                     .and_then(image::DynamicImage::from_decoder),
+                ImageFormat::Exr => {
+                    image::load_from_memory_with_format(data.bytes(), image::ImageFormat::OpenExr)
+                        .map(image::DynamicImage::into_rgba8)
+                        .map(image::DynamicImage::ImageRgba8)
+                }
                 _ => return None,
             }
             .log_err()?;
@@ -494,6 +499,7 @@ mod tests {
     use base64::Engine as _;
     use gpui::TestAppContext;
     use image::ImageDecoder as _;
+    use image::{DynamicImage, ImageBuffer, Rgba};
 
     fn base64_to_png_bytes(base64_png: &str) -> Vec<u8> {
         base64::engine::general_purpose::STANDARD
@@ -526,6 +532,15 @@ mod tests {
         out
     }
 
+    fn single_pixel_exr_bytes(pixel: [f32; 4]) -> Vec<u8> {
+        let image = DynamicImage::ImageRgba32F(ImageBuffer::from_pixel(1, 1, Rgba(pixel)));
+        let mut bytes = Cursor::new(Vec::new());
+        image
+            .write_with_encoder(image::codecs::openexr::OpenExrEncoder::new(&mut bytes))
+            .expect("exr encoding should succeed");
+        bytes.into_inner()
+    }
+
     #[gpui::test]
     async fn test_from_image_downscales_to_default_5mb_limit(cx: &mut TestAppContext) {
         // Pick a size that reliably produces a PNG > 5MB when filled with noise.
@@ -555,6 +570,32 @@ mod tests {
             w < 4096 || h < 4096,
             "expected image to be downscaled in at least one dimension; got {w}x{h}"
         );
+    }
+
+    #[gpui::test]
+    async fn test_from_image_converts_exr_to_png(cx: &mut TestAppContext) {
+        let exr_bytes = single_pixel_exr_bytes([1.0_f32, 0.5_f32, 0.25_f32, 1.0_f32]);
+        let expected_pixel =
+            image::load_from_memory_with_format(&exr_bytes, image::ImageFormat::OpenExr)
+                .expect("generated EXR should decode")
+                .into_rgba8()
+                .get_pixel(0, 0)
+                .0;
+        let image = gpui::Image::from_bytes(ImageFormat::Exr, exr_bytes);
+
+        let language_model_image = cx
+            .update(|cx| LanguageModelImage::from_image(Arc::new(image), cx))
+            .await
+            .expect("EXR conversion should succeed");
+
+        let encoded_png = base64_to_png_bytes(language_model_image.source.as_ref());
+        let decoded_png =
+            image::load_from_memory_with_format(&encoded_png, image::ImageFormat::Png)
+                .expect("language model payload should decode as PNG")
+                .into_rgba8();
+
+        assert_eq!(decoded_png.dimensions(), (1, 1));
+        assert_eq!(decoded_png.get_pixel(0, 0).0, expected_pixel);
     }
 
     #[test]

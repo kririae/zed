@@ -6,7 +6,8 @@ use anyhow::{Context as _, Result};
 use collections::{HashMap, HashSet, hash_map};
 use futures::{StreamExt, channel::oneshot};
 use gpui::{
-    App, AsyncApp, Context, Entity, EventEmitter, Img, Subscription, Task, WeakEntity, prelude::*,
+    App, AsyncApp, Context, Entity, EventEmitter, Img, SharedString, Subscription, Task,
+    WeakEntity, prelude::*,
 };
 pub use image::ImageFormat;
 use image::{ExtendedColorType, GenericImageView, ImageReader};
@@ -15,6 +16,7 @@ use rpc::{AnyProtoClient, ErrorExt as _, TypedEnvelope, proto};
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use util::{ResultExt, rel_path::RelPath};
 use worktree::{LoadedBinaryFile, PathChange, Worktree, WorktreeId};
 
@@ -41,6 +43,7 @@ impl From<NonZeroU64> for ImageId {
 
 #[derive(Debug)]
 pub enum ImageItemEvent {
+    LoadStateChanged,
     ReloadNeeded,
     Reloaded,
     FileHandleChanged,
@@ -49,13 +52,20 @@ pub enum ImageItemEvent {
 
 impl EventEmitter<ImageItemEvent> for ImageItem {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageLoadState {
+    Loading,
+    Loaded,
+    Failed(SharedString),
+}
+
 pub enum ImageStoreEvent {
     ImageAdded(Entity<ImageItem>),
 }
 
 impl EventEmitter<ImageStoreEvent> for ImageStore {}
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageMetadata {
     pub width: u32,
     pub height: u32,
@@ -64,7 +74,7 @@ pub struct ImageMetadata {
     pub format: ImageFormat,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageColorInfo {
     pub channels: u8,
     pub bits_per_channel: u8,
@@ -102,9 +112,10 @@ impl ImageColorInfo {
 pub struct ImageItem {
     pub id: ImageId,
     pub file: Arc<worktree::File>,
-    pub image: Arc<gpui::Image>,
-    reload_task: Option<Task<()>>,
+    pub image: Option<Arc<gpui::Image>>,
+    pub load_task: Option<Task<()>>,
     pub image_metadata: Option<ImageMetadata>,
+    pub load_state: ImageLoadState,
 }
 
 impl ImageItem {
@@ -144,6 +155,39 @@ impl ImageItem {
         Self::compute_metadata_from_bytes(&image_bytes)
     }
 
+    pub async fn wait_for_renderable_image(
+        image_item: Entity<ImageItem>,
+        cx: &mut AsyncApp,
+    ) -> Result<Arc<gpui::Image>> {
+        loop {
+            let (image, load_state) =
+                cx.read_entity(&image_item, |image_item, _cx| {
+                    (image_item.image.clone(), image_item.load_state.clone())
+                });
+
+            if let Some(image) = image {
+                return Ok(image);
+            }
+
+            if let ImageLoadState::Failed(message) = load_state {
+                anyhow::bail!("{message}");
+            }
+
+            cx.background_executor().timer(Duration::from_millis(10)).await;
+        }
+    }
+
+    pub fn is_loading(&self) -> bool {
+        matches!(self.load_state, ImageLoadState::Loading)
+    }
+
+    pub fn load_error(&self) -> Option<&SharedString> {
+        match &self.load_state {
+            ImageLoadState::Failed(message) => Some(message),
+            ImageLoadState::Loading | ImageLoadState::Loaded => None,
+        }
+    }
+
     pub fn project_path(&self, cx: &App) -> ProjectPath {
         ProjectPath {
             worktree_id: self.file.worktree_id(cx),
@@ -153,6 +197,46 @@ impl ImageItem {
 
     pub fn abs_path(&self, cx: &App) -> Option<PathBuf> {
         Some(self.file.as_local()?.abs_path(cx))
+    }
+
+    fn set_loaded(
+        &mut self,
+        file: Option<Arc<worktree::File>>,
+        image: Arc<gpui::Image>,
+        metadata: Option<ImageMetadata>,
+        cx: &mut Context<Self>,
+    ) {
+        let file_changed = file.as_ref().is_some_and(|file| {
+            self.file.worktree != file.worktree
+                || self.file.path != file.path
+                || self.file.disk_state != file.disk_state
+                || self.file.entry_id != file.entry_id
+                || self.file.is_local != file.is_local
+                || self.file.is_private != file.is_private
+        });
+        if let Some(file) = file {
+            self.file = file;
+        }
+        self.image = Some(image);
+        self.image_metadata = metadata;
+        self.load_state = ImageLoadState::Loaded;
+        self.load_task = None;
+
+        cx.emit(ImageItemEvent::LoadStateChanged);
+        if file_changed {
+            cx.emit(ImageItemEvent::FileHandleChanged);
+        }
+        if self.image_metadata.is_some() {
+            cx.emit(ImageItemEvent::MetadataUpdated);
+        }
+        cx.notify();
+    }
+
+    fn set_failed(&mut self, message: SharedString, cx: &mut Context<Self>) {
+        self.load_state = ImageLoadState::Failed(message);
+        self.load_task = None;
+        cx.emit(ImageItemEvent::LoadStateChanged);
+        cx.notify();
     }
 
     fn file_updated(&mut self, new_file: Arc<worktree::File>, cx: &mut Context<Self>) {
@@ -184,20 +268,35 @@ impl ImageItem {
         let (tx, rx) = futures::channel::oneshot::channel();
 
         let content = local_file.load_bytes(cx);
-        self.reload_task = Some(cx.spawn(async move |this, cx| {
-            if let Some(image) = content
-                .await
-                .context("Failed to load image content")
-                .and_then(create_gpui_image)
-                .log_err()
-            {
+        self.load_state = ImageLoadState::Loading;
+        cx.emit(ImageItemEvent::LoadStateChanged);
+        cx.notify();
+
+        self.load_task = Some(cx.spawn(async move |this, cx| {
+            let load_result = async {
+                let content = content.await.context("Failed to load image content")?;
+                let image = create_gpui_image(content.clone())?;
+                let metadata = ImageItem::compute_metadata_from_bytes(&content)?;
+
                 this.update(cx, |this, cx| {
-                    this.image = image;
+                    this.set_loaded(None, image, Some(metadata), cx);
                     cx.emit(ImageItemEvent::Reloaded);
+                })?;
+
+                anyhow::Ok(())
+            }
+            .await;
+
+            if let Err(error) = load_result {
+                let message: SharedString = error.to_string().into();
+                this.update(cx, |this, cx| {
+                    this.set_failed(message, cx);
                 })
                 .log_err();
+                Err::<(), _>(error).log_err();
             }
-            _ = tx.send(());
+
+            tx.send(()).log_err();
         }));
         Some(rx)
     }
@@ -278,8 +377,7 @@ struct RemoteImageStore {
     upstream_client: AnyProtoClient,
     project_id: u64,
     loading_remote_images_by_id: HashMap<ImageId, LoadingRemoteImage>,
-    remote_image_listeners:
-        HashMap<ImageId, Vec<oneshot::Sender<anyhow::Result<Entity<ImageItem>>>>>,
+    pending_placeholders_by_remote_id: HashMap<ImageId, Entity<ImageItem>>,
     loaded_images: HashMap<ImageId, Entity<ImageItem>>,
 }
 
@@ -294,6 +392,44 @@ struct LocalImageStore {
     local_image_ids_by_entry_id: HashMap<ProjectEntryId, ImageId>,
     image_store: WeakEntity<ImageStore>,
     _subscription: Subscription,
+}
+
+fn file_for_image_path(
+    worktree: Entity<Worktree>,
+    path: Arc<RelPath>,
+    is_local: bool,
+    cx: &App,
+) -> Arc<worktree::File> {
+    let snapshot = worktree.read(cx).snapshot();
+    if let Some(entry) = snapshot.entry_for_path(path.as_ref()) {
+        if is_local {
+            return worktree::File::for_entry(entry.clone(), worktree);
+        }
+
+        return Arc::new(worktree::File {
+            worktree,
+            path: entry.path.clone(),
+            disk_state: match entry.mtime {
+                Some(mtime) => DiskState::Present {
+                    mtime,
+                    size: entry.size,
+                },
+                None => DiskState::New,
+            },
+            entry_id: Some(entry.id),
+            is_local: false,
+            is_private: entry.is_private,
+        });
+    }
+
+    Arc::new(worktree::File {
+        worktree,
+        path,
+        disk_state: DiskState::New,
+        entry_id: None,
+        is_local,
+        is_private: false,
+    })
 }
 
 pub struct ImageStore {
@@ -345,7 +481,7 @@ impl ImageStore {
                 upstream_client,
                 project_id,
                 loading_remote_images_by_id: Default::default(),
-                remote_image_listeners: Default::default(),
+                pending_placeholders_by_remote_id: Default::default(),
                 loaded_images: Default::default(),
             })),
             opened_images: Default::default(),
@@ -461,6 +597,16 @@ impl ImageStore {
         Ok(())
     }
 
+    fn replace_image_id(
+        &mut self,
+        old_id: ImageId,
+        new_id: ImageId,
+        image: &Entity<ImageItem>,
+    ) {
+        self.opened_images.remove(&old_id);
+        self.opened_images.insert(new_id, image.downgrade());
+    }
+
     fn on_image_event(
         &mut self,
         image: Entity<ImageItem>,
@@ -502,24 +648,6 @@ impl ImageStore {
 }
 
 impl RemoteImageStore {
-    pub fn wait_for_remote_image(
-        &mut self,
-        id: ImageId,
-        cx: &mut Context<Self>,
-    ) -> Task<Result<Entity<ImageItem>>> {
-        if let Some(image) = self.loaded_images.remove(&id) {
-            return Task::ready(Ok(image));
-        }
-
-        let (tx, rx) = oneshot::channel();
-        self.remote_image_listeners.entry(id).or_default().push(tx);
-
-        cx.spawn(async move |_this, cx| {
-            let result = cx.background_spawn(async move { rx.await? }).await;
-            result
-        })
-    }
-
     pub fn handle_create_image_for_peer(
         &mut self,
         envelope: TypedEnvelope<proto::CreateImageForPeer>,
@@ -555,43 +683,62 @@ impl RemoteImageStore {
                 loading.chunks.push(chunk.data);
 
                 if loading.received_size == loading.state.content_size {
-                    let loading = self.loading_remote_images_by_id.remove(&image_id).unwrap();
+                    let loading = self
+                        .loading_remote_images_by_id
+                        .remove(&image_id)
+                        .context("completed image missing from loading state")?;
 
                     let mut content = Vec::with_capacity(loading.received_size as usize);
                     for chunk_data in loading.chunks {
                         content.extend_from_slice(&chunk_data);
                     }
 
-                    let image_metadata = ImageItem::compute_metadata_from_bytes(&content).log_err();
-                    let image = create_gpui_image(content)?;
+                    let placeholder = self.pending_placeholders_by_remote_id.remove(&image_id);
+                    let built_image = (|| -> Result<_> {
+                        let proto_file = loading.state.file.context("missing file in image state")?;
+                        let worktree_id = WorktreeId::from_proto(proto_file.worktree_id);
+                        let worktree = worktree_store
+                            .read(cx)
+                            .worktree_for_id(worktree_id, cx)
+                            .context("worktree not found")?;
+                        let file = Arc::new(
+                            worktree::File::from_proto(proto_file, worktree, cx)
+                                .context("invalid file in image state")?,
+                        );
+                        let image_metadata =
+                            ImageItem::compute_metadata_from_bytes(&content).log_err();
+                        let image = create_gpui_image(content)?;
+                        Ok((file, image, image_metadata))
+                    })();
 
-                    let proto_file = loading.state.file.context("missing file in image state")?;
-                    let worktree_id = WorktreeId::from_proto(proto_file.worktree_id);
-                    let worktree = worktree_store
-                        .read(cx)
-                        .worktree_for_id(worktree_id, cx)
-                        .context("worktree not found")?;
-
-                    let file = Arc::new(
-                        worktree::File::from_proto(proto_file, worktree, cx)
-                            .context("invalid file in image state")?,
-                    );
-
-                    let entity = cx.new(|_cx| ImageItem {
-                        id: image_id,
-                        file,
-                        image,
-                        image_metadata,
-                        reload_task: None,
-                    });
-
-                    if let Some(listeners) = self.remote_image_listeners.remove(&image_id) {
-                        for listener in listeners {
-                            listener.send(Ok(entity.clone())).ok();
+                    match (placeholder, built_image) {
+                        (Some(placeholder), Ok((file, image, image_metadata))) => {
+                            placeholder.update(cx, |image_item, cx| {
+                                image_item.set_loaded(Some(file), image, image_metadata, cx);
+                            });
+                            Ok(None)
                         }
-                    }
+                        (Some(placeholder), Err(error)) => {
+                            let message: SharedString = error.to_string().into();
+                            placeholder.update(cx, |image_item, cx| {
+                                image_item.set_failed(message, cx);
+                            });
+                            Err(error)
+                        }
+                        (None, Ok((file, image, image_metadata))) => {
+                            let entity = cx.new(|_cx| ImageItem {
+                                id: image_id,
+                                file,
+                                image: Some(image),
+                                image_metadata,
+                                load_task: None,
+                                load_state: ImageLoadState::Loaded,
+                            });
 
-                    Ok(Some(entity))
+                            Ok(Some(entity))
+                        }
+                        (None, Err(error)) => Err(error),
+                    }
                 } else {
                     Ok(None)
                 }
@@ -614,22 +761,20 @@ impl ImageStoreImpl for Entity<LocalImageStore> {
         cx: &mut Context<ImageStore>,
     ) -> Task<Result<Entity<ImageItem>>> {
         let this = self.clone();
-
+        let file = file_for_image_path(worktree.clone(), path.clone(), true, cx);
         let load_file = worktree.update(cx, |worktree, cx| {
             worktree.load_binary_file(path.as_ref(), cx)
         });
-        cx.spawn(async move |image_store, cx| {
-            let LoadedBinaryFile { file, content } = load_file.await?;
-            let image = create_gpui_image(content)?;
 
+        cx.spawn(async move |image_store, cx| {
             let entity = cx.new(|cx| ImageItem {
                 id: cx.entity_id().as_non_zero_u64().into(),
                 file: file.clone(),
-                image,
+                image: None,
+                load_task: None,
                 image_metadata: None,
-                reload_task: None,
+                load_state: ImageLoadState::Loading,
             });
-
             let image_id = cx.read_entity(&entity, |model, _| model.id);
 
             this.update(cx, |this, cx| {
@@ -650,6 +795,35 @@ impl ImageStoreImpl for Entity<LocalImageStore> {
 
                 anyhow::Ok(())
             })?;
+
+            let load_task = cx.spawn({
+                let entity = entity.clone();
+                async move |cx| {
+                    let load_result = async {
+                        let LoadedBinaryFile { file, content } = load_file.await?;
+                        let image = create_gpui_image(content.clone())?;
+                        let metadata = ImageItem::compute_metadata_from_bytes(&content)?;
+
+                        entity.update(cx, |image_item, cx| {
+                            image_item.set_loaded(Some(file), image, Some(metadata), cx);
+                        });
+
+                        anyhow::Ok(())
+                    }
+                    .await;
+
+                    if let Err(error) = load_result {
+                        let message: SharedString = error.to_string().into();
+                        entity.update(cx, |image_item, cx| {
+                            image_item.set_failed(message, cx);
+                        });
+                        Err::<(), _>(error).log_err();
+                    }
+                }
+            });
+            entity.update(cx, |image_item, _cx| {
+                image_item.load_task = Some(load_task);
+            });
 
             Ok(entity)
         })
@@ -687,30 +861,100 @@ impl ImageStoreImpl for Entity<RemoteImageStore> {
         cx: &mut Context<ImageStore>,
     ) -> Task<Result<Entity<ImageItem>>> {
         let worktree_id = worktree.read(cx).id().to_proto();
+        let file = file_for_image_path(worktree, path.clone(), false, cx);
         let (project_id, client) = {
             let store = self.read(cx);
             (store.project_id, store.upstream_client.clone())
         };
         let remote_store = self.clone();
 
-        cx.spawn(async move |_image_store, cx| {
-            let response = client
-                .request(rpc::proto::OpenImageByPath {
-                    project_id,
-                    worktree_id,
-                    path: path.to_proto(),
-                })
-                .await?;
+        cx.spawn(async move |image_store, cx| {
+            let placeholder = cx.new(|cx| ImageItem {
+                id: cx.entity_id().as_non_zero_u64().into(),
+                file,
+                image: None,
+                load_task: None,
+                image_metadata: None,
+                load_state: ImageLoadState::Loading,
+            });
+            let placeholder_id = cx.read_entity(&placeholder, |image, _| image.id);
 
-            let image_id = ImageId::from(
-                NonZeroU64::new(response.image_id).context("invalid image_id in response")?,
-            );
+            image_store.update(cx, |image_store, cx| {
+                image_store.add_image(placeholder.clone(), cx)
+            })??;
 
-            remote_store
-                .update(cx, |remote_store, cx| {
-                    remote_store.wait_for_remote_image(image_id, cx)
-                })
-                .await
+            let request_task = cx.spawn({
+                let placeholder = placeholder.clone();
+                let image_store = image_store.clone();
+                async move |cx| {
+                    let request_result = async {
+                        let response = client
+                            .request(rpc::proto::OpenImageByPath {
+                                project_id,
+                                worktree_id,
+                                path: path.to_proto(),
+                            })
+                            .await?;
+
+                        let remote_image_id = ImageId::from(
+                            NonZeroU64::new(response.image_id)
+                                .context("invalid image_id in response")?,
+                        );
+
+                        placeholder.update(cx, |image_item, _cx| {
+                            image_item.id = remote_image_id;
+                        });
+                        image_store.update(cx, |image_store, _cx| {
+                            image_store.replace_image_id(
+                                placeholder_id,
+                                remote_image_id,
+                                &placeholder,
+                            );
+                        })?;
+
+                        let preloaded = remote_store.update(cx, |remote_store, _cx| {
+                            remote_store.loaded_images.remove(&remote_image_id)
+                        });
+
+                        if let Some(preloaded) = preloaded {
+                            let (file, image, metadata) =
+                                cx.read_entity(&preloaded, |image, _cx| {
+                                    (
+                                        image.file.clone(),
+                                        image.image.clone(),
+                                        image.image_metadata,
+                                    )
+                                });
+                            let image = image.context("preloaded remote image missing bytes")?;
+                            placeholder.update(cx, |image_item, cx| {
+                                image_item.set_loaded(Some(file), image, metadata, cx);
+                            });
+                        } else {
+                            remote_store.update(cx, |remote_store, _cx| {
+                                remote_store
+                                    .pending_placeholders_by_remote_id
+                                    .insert(remote_image_id, placeholder.clone());
+                            });
+                        }
+
+                        anyhow::Ok(())
+                    }
+                    .await;
+
+                    if let Err(error) = request_result {
+                        let message: SharedString = error.to_string().into();
+                        placeholder.update(cx, |image_item, cx| {
+                            image_item.set_failed(message, cx);
+                        });
+                        Err::<(), _>(error).log_err();
+                    }
+                }
+            });
+            placeholder.update(cx, |image_item, _cx| {
+                image_item.load_task = Some(request_task);
+            });
+
+            Ok(placeholder)
         })
     }
 

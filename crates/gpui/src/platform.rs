@@ -36,13 +36,19 @@ use crate::{
     ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task,
     ThreadTaskTimings, Window, WindowControlArea, hash, point, px, size,
 };
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use async_task::Runnable;
 use futures::channel::oneshot;
-#[cfg(any(test, feature = "test-support"))]
+use gainforge::{
+    GamutClipping, MappingColorSpace, RgbToneMapperParameters, ToneMappingMethod, TransferFunction,
+    create_tone_mapper_rgba16,
+};
 use image::RgbaImage;
 use image::codecs::gif::GifDecoder;
-use image::{AnimationDecoder as _, Frame};
+use image::{AnimationDecoder as _, Frame, GenericImageView, ImageBuffer};
+use moxcms::{
+    CicpColorPrimaries, CicpProfile, ColorProfile, MatrixCoefficients, TransferCharacteristics,
+};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use scheduler::Instant;
 pub use scheduler::RunnableMeta;
@@ -60,7 +66,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 use strum::EnumIter;
 use uuid::Uuid;
@@ -1907,20 +1913,6 @@ impl Image {
 
     /// Convert the clipboard image to an `ImageData` object.
     pub fn to_image_data(&self, svg_renderer: SvgRenderer) -> Result<Arc<RenderImage>> {
-        fn frames_for_image(
-            bytes: &[u8],
-            format: image::ImageFormat,
-        ) -> Result<SmallVec<[Frame; 1]>> {
-            let mut data = image::load_from_memory_with_format(bytes, format)?.into_rgba8();
-
-            // Convert from RGBA to BGRA.
-            for pixel in data.chunks_exact_mut(4) {
-                pixel.swap(0, 2);
-            }
-
-            Ok(SmallVec::from_elem(Frame::new(data), 1))
-        }
-
         let frames = match self.format {
             ImageFormat::Gif => {
                 let decoder = GifDecoder::new(Cursor::new(&self.bytes))?;
@@ -1937,13 +1929,15 @@ impl Image {
 
                 frames
             }
-            ImageFormat::Png => frames_for_image(&self.bytes, image::ImageFormat::Png)?,
-            ImageFormat::Jpeg => frames_for_image(&self.bytes, image::ImageFormat::Jpeg)?,
-            ImageFormat::Webp => frames_for_image(&self.bytes, image::ImageFormat::WebP)?,
-            ImageFormat::Bmp => frames_for_image(&self.bytes, image::ImageFormat::Bmp)?,
-            ImageFormat::Tiff => frames_for_image(&self.bytes, image::ImageFormat::Tiff)?,
-            ImageFormat::Ico => frames_for_image(&self.bytes, image::ImageFormat::Ico)?,
-            ImageFormat::Exr => frames_for_image(&self.bytes, image::ImageFormat::OpenExr)?,
+            ImageFormat::Png => render_still_image_frames(&self.bytes, image::ImageFormat::Png)?,
+            ImageFormat::Jpeg => render_still_image_frames(&self.bytes, image::ImageFormat::Jpeg)?,
+            ImageFormat::Webp => render_still_image_frames(&self.bytes, image::ImageFormat::WebP)?,
+            ImageFormat::Bmp => render_still_image_frames(&self.bytes, image::ImageFormat::Bmp)?,
+            ImageFormat::Tiff => render_still_image_frames(&self.bytes, image::ImageFormat::Tiff)?,
+            ImageFormat::Ico => render_still_image_frames(&self.bytes, image::ImageFormat::Ico)?,
+            ImageFormat::Exr => {
+                render_still_image_frames(&self.bytes, image::ImageFormat::OpenExr)?
+            }
             ImageFormat::Svg => {
                 return svg_renderer
                     .render_single_frame(&self.bytes, 1.0, false)
@@ -1963,6 +1957,88 @@ impl Image {
     pub fn bytes(&self) -> &[u8] {
         self.bytes.as_slice()
     }
+}
+
+pub(crate) fn render_still_image_frames(
+    bytes: &[u8],
+    format: image::ImageFormat,
+) -> Result<SmallVec<[Frame; 1]>> {
+    let data = match format {
+        image::ImageFormat::OpenExr | image::ImageFormat::Hdr => {
+            tone_map_hdr_still_image(bytes, format)?
+        }
+        _ => {
+            let mut data = image::load_from_memory_with_format(bytes, format)?.into_rgba8();
+            for pixel in data.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+            data
+        }
+    };
+
+    Ok(SmallVec::from_elem(Frame::new(data), 1))
+}
+
+fn tone_map_hdr_still_image(bytes: &[u8], format: image::ImageFormat) -> Result<RgbaImage> {
+    let image = image::load_from_memory_with_format(bytes, format)?;
+    let (width, height) = image.dimensions();
+    let mut linear_rgba = image.into_rgba32f().into_raw();
+
+    hdr_sdr_tone_mapper()?
+        .tonemap_linearized_lane(&mut linear_rgba)
+        .map_err(|error| anyhow::anyhow!("gainforge tone mapping failed: {error}"))?;
+
+    let mut bgra = Vec::with_capacity(linear_rgba.len());
+    for pixel in linear_rgba.chunks_exact(4) {
+        bgra.push(linear_to_srgb_u8(pixel[2]));
+        bgra.push(linear_to_srgb_u8(pixel[1]));
+        bgra.push(linear_to_srgb_u8(pixel[0]));
+        bgra.push(linear_alpha_to_u8(pixel[3]));
+    }
+
+    ImageBuffer::from_raw(width, height, bgra)
+        .context("tone-mapped HDR image dimensions did not match output buffer")
+}
+
+fn hdr_sdr_tone_mapper() -> Result<Arc<dyn gainforge::ToneMapper<u16> + Send + Sync>> {
+    static TONE_MAPPER: OnceLock<
+        Result<Arc<dyn gainforge::ToneMapper<u16> + Send + Sync>, String>,
+    > = OnceLock::new();
+
+    let tone_mapper = TONE_MAPPER.get_or_init(|| {
+        let input_profile = ColorProfile::new_from_cicp(CicpProfile {
+            color_primaries: CicpColorPrimaries::Bt709,
+            transfer_characteristics: TransferCharacteristics::Linear,
+            matrix_coefficients: MatrixCoefficients::Bt709,
+            full_range: false,
+        });
+
+        create_tone_mapper_rgba16(
+            &input_profile,
+            &ColorProfile::new_srgb(),
+            ToneMappingMethod::Aces,
+            MappingColorSpace::Rgb(RgbToneMapperParameters {
+                exposure: 1.0,
+                gamut_clipping: GamutClipping::Clip,
+            }),
+        )
+        .map(|tone_mapper| tone_mapper as Arc<dyn gainforge::ToneMapper<u16> + Send + Sync>)
+        .map_err(|error| error.to_string())
+    });
+
+    tone_mapper
+        .as_ref()
+        .map(Arc::clone)
+        .map_err(|error| anyhow::anyhow!("failed to create HDR tone mapper: {error}"))
+}
+
+fn linear_to_srgb_u8(linear: f32) -> u8 {
+    let encoded = TransferFunction::Srgb.gamma(linear.clamp(0.0, 1.0));
+    (encoded * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+fn linear_alpha_to_u8(alpha: f32) -> u8 {
+    (alpha.clamp(0.0, 1.0) * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
 /// A clipboard item that should be copied to the clipboard
@@ -2025,5 +2101,51 @@ impl From<String> for ClipboardString {
             text: value,
             metadata: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{DynamicImage, ImageBuffer, Rgba};
+
+    fn single_pixel_exr(pixel: [f32; 4]) -> Vec<u8> {
+        let image = DynamicImage::ImageRgba32F(ImageBuffer::from_pixel(1, 1, Rgba(pixel)));
+        let mut bytes = Cursor::new(Vec::new());
+        image
+            .write_to(&mut bytes, image::ImageFormat::OpenExr)
+            .expect("write test exr");
+        bytes.into_inner()
+    }
+
+    #[test]
+    fn exr_render_conversion_tone_maps_highlights_and_encodes_srgb_midtones() {
+        let exr_bytes = single_pixel_exr([0.5, 0.25, 4.0, 1.0]);
+        let image = Image::from_bytes(ImageFormat::Exr, exr_bytes);
+        let svg_renderer = SvgRenderer::new(Arc::new(()));
+
+        let render_image = image.to_image_data(svg_renderer).expect("decode exr");
+        let bytes = render_image.as_bytes(0).expect("rendered frame bytes");
+
+        assert_eq!(bytes.len(), 4);
+
+        let blue = bytes[0];
+        let green = bytes[1];
+        let red = bytes[2];
+        let alpha = bytes[3];
+
+        assert!(
+            red > 128,
+            "expected midtone red to be display-encoded, got {red}"
+        );
+        assert!(
+            green > 64,
+            "expected quarter-tone green to be display-encoded, got {green}"
+        );
+        assert!(
+            blue < 255,
+            "expected HDR blue highlight to be tone-mapped instead of hard-clipped, got {blue}"
+        );
+        assert_eq!(alpha, 255);
     }
 }
